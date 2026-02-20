@@ -104,10 +104,10 @@ class Servicio(models.Model):
     duracion = models.DurationField()
     precio = models.DecimalField(max_digits=8, decimal_places=2)
     activo = models.BooleanField(default=True)
+    imagen = models.ImageField(upload_to="servicios/", blank=True, null=True)
 
     def __str__(self):
         return f"{self.nombre} ({self.clinica.nombre})"
-
 
 class Paciente(models.Model):
     ESTADO_TRATAMIENTO = [
@@ -272,3 +272,21 @@ class Pago(models.Model):
 
     def __str__(self):
         return f"Pago #{self.id} - Cita {self.cita_id}"
+
+class BloqueoHorario(models.Model):
+    profesional = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="bloqueos_horario",
+    )
+    fecha = models.DateField()
+    hora_inicio = models.TimeField()
+    hora_termina = models.TimeField()
+    motivo = models.CharField(max_length=200, blank=True, default="")
+    creado = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-fecha", "-hora_inicio"]
+
+    def __str__(self):
+        return f"Bloqueo {self.fecha} {self.hora_inicio}-{self.hora_termina} ({self.profesional_id})"

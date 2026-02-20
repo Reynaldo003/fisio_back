@@ -2,8 +2,7 @@
 from django.contrib.auth.models import User
 from django.db.models import Sum
 from rest_framework import serializers
-from .models import Clinica, Paciente, Comentario, Cita, Servicio, Pago, StaffProfile
-
+from .models import Clinica, Paciente, Comentario, Cita, Servicio, Pago, StaffProfile, BloqueoHorario
 
 class StaffUserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True)
@@ -144,9 +143,20 @@ class ComentarioPublicSerializer(serializers.ModelSerializer):
 
 
 class ServicioSerializer(serializers.ModelSerializer):
+    imagen_url = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Servicio
         fields = "__all__"
+
+    def get_imagen_url(self, obj):
+        request = self.context.get("request")
+        if not obj.imagen:
+            return None
+        url = obj.imagen.url
+        return request.build_absolute_uri(url) if request else url
+        #return request.build_absolute_uri(obj.imagen.url) if request else obj.imagen.url
+
 
 
 class CitaSerializer(serializers.ModelSerializer):
@@ -170,6 +180,7 @@ class CitaSerializer(serializers.ModelSerializer):
         return full or u.username
 
 
+# core/serializers.py  (solo la parte del CitaCreateSerializer)
 class CitaCreateSerializer(serializers.ModelSerializer):
     paciente = PacienteInlineSerializer()
 
@@ -186,7 +197,12 @@ class CitaCreateSerializer(serializers.ModelSerializer):
             "metodo_pago",
             "estado",
             "notas",
+
+            # ✅ IMPORTANTES para pagos
             "pagado",
+            "descuento_porcentaje",
+            "anticipo",
+            "monto_final",
         ]
 
     def create(self, validated_data):
@@ -210,7 +226,6 @@ class CitaCreateSerializer(serializers.ModelSerializer):
             },
         )
         return Cita.objects.create(paciente=paciente, **validated_data)
-
 
 class PagoSerializer(serializers.ModelSerializer):
     paciente_nombre = serializers.SerializerMethodField(read_only=True)
@@ -366,3 +381,16 @@ class PagoSerializer(serializers.ModelSerializer):
         )
 
         return pago
+
+
+class BloqueoHorarioSerializer(serializers.ModelSerializer):
+    profesional_nombre = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BloqueoHorario
+        fields = ["id", "profesional", "profesional_nombre", "fecha", "hora_inicio", "hora_termina", "motivo", "creado"]
+
+    def get_profesional_nombre(self, obj):
+        u = obj.profesional
+        full = f"{u.first_name or ''} {u.last_name or ''}".strip()
+        return full or u.username

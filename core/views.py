@@ -3,6 +3,13 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import unicodedata
 
+from decimal import Decimal
+from django.conf import settings
+from django.utils import timezone
+from django.db import models
+from decimal import Decimal
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.http import HttpResponse
@@ -15,7 +22,7 @@ from rest_framework.response import Response
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 
-from .models import Paciente, Comentario, Cita, Servicio, Clinica, Pago, StaffProfile
+from .models import Paciente, Comentario, Cita, Servicio, Clinica, Pago, StaffProfile,BloqueoHorario
 from .serializers import (
     PacienteSerializer,
     ComentarioSerializer,
@@ -26,6 +33,7 @@ from .serializers import (
     CitaCreateSerializer,
     PagoSerializer,
     StaffUserSerializer,
+    BloqueoHorarioSerializer,
 )
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from .permissions import IsAdminUserStrict
@@ -34,7 +42,7 @@ from .permissions import IsAdminUserStrict
 # =========================
 # Helpers
 # =========================
-PUBLIC_DEFAULT_PRO_NAME = "edgar mauricio medina cruz"
+PUBLIC_DEFAULT_PRO_NAME = "l.f.t edgar mauricio medina cruz"
 
 
 def _normalize_name(s: str) -> str:
@@ -221,6 +229,8 @@ class ComentarioViewSet(viewsets.ModelViewSet):
 
         return Response({"detail": "estado inválido. Usa 'aprobado' o 'rechazado'."}, status=400)
 
+# core/views.py (fragmento: dentro de CitaViewSet)
+from rest_framework.exceptions import ValidationError
 
 class CitaViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
@@ -228,10 +238,8 @@ class CitaViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         role = _user_role(self.request.user)
         qs = Cita.objects.select_related("paciente", "servicio", "profesional").order_by("fecha", "hora_inicio")
-
         if _is_professional_role(role):
             qs = qs.filter(profesional=self.request.user)
-
         return qs
 
     def get_serializer_class(self):
@@ -272,64 +280,27 @@ class CitaViewSet(viewsets.ModelViewSet):
         else:
             profesional_id = self.request.user.id
 
-        if profesional_id and fecha and hora_inicio and hora_termina:
-            hi = datetime.strptime(hora_inicio, "%H:%M:%S").time()
-            ht = datetime.strptime(hora_termina, "%H:%M:%S").time()
-            if _validar_conflicto_cita(
-                profesional_id=int(profesional_id),
-                fecha=fecha,
-                hora_inicio=hi,
-                hora_termina=ht,
-                exclude_id=None,
-            ):
-                raise ValueError("Conflicto: horario ocupado para este profesional.")
+        profesional_obj = User.objects.filter(id=profesional_id).first()
+        if not profesional_obj:
+            raise ValidationError({"profesional": "Profesional inválido."})
 
-        profesional_obj = User.objects.filter(id=profesional_id).first() or self.request.user
-
-        serializer.save(
-            profesional=profesional_obj,
-            hora_termina=hora_termina,
-        )
+        # ✅ HORA COMPARTIDA: NO VALIDAR CONFLICTO (permitimos múltiples citas en el mismo rango)
+        serializer.save(profesional=profesional_obj)
 
     def perform_update(self, serializer):
         data = self.request.data
         role = _user_role(self.request.user)
-        instance = self.get_object()
 
-        profesional_id = instance.profesional_id
-        if _can_see_all_agendas(role) and data.get("profesional"):
-            profesional_id = int(data.get("profesional"))
-
-        fecha = data.get("fecha") or instance.fecha.isoformat()
-
-        hora_inicio = data.get("hora_inicio")
-        hora_termina = data.get("hora_termina")
-
-        if hora_inicio and len(hora_inicio) == 5:
-            hora_inicio = f"{hora_inicio}:00"
-        if hora_termina and len(hora_termina) == 5:
-            hora_termina = f"{hora_termina}:00"
-
-        hi = instance.hora_inicio
-        ht = instance.hora_termina
-        if hora_inicio:
-            hi = datetime.strptime(hora_inicio, "%H:%M:%S").time()
-        if hora_termina:
-            ht = datetime.strptime(hora_termina, "%H:%M:%S").time()
-
-        if _validar_conflicto_cita(
-            profesional_id=int(profesional_id),
-            fecha=fecha,
-            hora_inicio=hi,
-            hora_termina=ht,
-            exclude_id=instance.id,
-        ):
+        profesional_id_payload = data.get("profesional")
+        if _can_see_all_agendas(role) and profesional_id_payload:
+            profesional_obj = User.objects.filter(id=int(profesional_id_payload)).first()
+            if not profesional_obj:
+                raise ValidationError({"profesional": "Profesional inválido."})
+            serializer.save(profesional=profesional_obj)
             return
 
-        if _can_see_all_agendas(role) and data.get("profesional"):
-            serializer.save(profesional_id=profesional_id)
-        else:
-            serializer.save()
+        # profesional no admin-like: no permitir cambiar profesional
+        serializer.save()
 
     def update(self, request, *args, **kwargs):
         partial = True
@@ -358,6 +329,11 @@ class ServicioViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ServicioSerializer
     permission_classes = [permissions.AllowAny]
 
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["request"] = self.request
+        return ctx
+
 
 class PagoViewSet(viewsets.ModelViewSet):
     queryset = (
@@ -383,43 +359,385 @@ class PagoViewSet(viewsets.ModelViewSet):
         cita = pago.cita
         clinica = _first_clinica()
 
+        RFC_FIJO = "MECE000513F74"
+
+        # =========================
+        # Paths en MEDIA
+        # =========================
+        def media_path(filename: str):
+            try:
+                # settings.MEDIA_ROOT puede ser str o Path
+                return (settings.MEDIA_ROOT / filename) if hasattr(settings, "MEDIA_ROOT") else None
+            except Exception:
+                return None
+
+        logo_path = media_path("fisionerv.png")
+        qr_path = media_path("qr.png")
+
+        # =========================
+        # Helpers
+        # =========================
+        def up(s: str) -> str:
+            return (s or "").strip().upper()
+
+        def safe_str(s) -> str:
+            return (s or "").strip()
+
+        def money(x) -> str:
+            try:
+                v = Decimal(x or 0)
+                return f"$ {v:,.2f}".upper()
+            except Exception:
+                return "$ 0.00"
+
+        def split_chunks(text: str, width_chars: int):
+            """
+            Parte texto en segmentos de longitud fija (simple y robusto para tickets).
+            """
+            t = up(text)
+            if not t:
+                return []
+            out = []
+            while len(t) > width_chars:
+                out.append(t[:width_chars])
+                t = t[width_chars:]
+            if t:
+                out.append(t)
+            return out
+
+        # Dibujo centrado (por ancho real del string)
+        def draw_center(c, y, text, font="Helvetica", size=8.5):
+            c.setFont(font, size)
+            t = up(text)
+            w = c.stringWidth(t, font, size)
+            x = (ticket_width - w) / 2
+            c.drawString(max(2 * mm, x), y, t)
+
+        # Dibujo "label izquierda" y "valor derecha"
+        def draw_lr(c, y, left, right, font="Helvetica", size=8.5):
+            c.setFont(font, size)
+            l = up(left)
+            r = up(right)
+
+            x_left = 4 * mm
+            x_right = ticket_width - 4 * mm
+
+            # Izquierda
+            c.drawString(x_left, y, l)
+
+            # Derecha (alineado a la derecha)
+            rw = c.stringWidth(r, font, size)
+            c.drawString(x_right - rw, y, r)
+
+        # =========================
+        # Datos negocio / personas
+        # =========================
+        negocio = safe_str(getattr(clinica, "nombre", "")) or "FISIONERV"
+        direccion = safe_str(getattr(clinica, "direccion", "")) or "DIRECCION NO CONFIGURADA"
+
         paciente = cita.paciente
         paciente_nombre = f"{paciente.nombres} {paciente.apellido_pat} {paciente.apellido_mat or ''}".strip()
 
         prof = cita.profesional
-        prof_nombre = f"{prof.first_name or ''} {prof.last_name or ''}".strip() or prof.username
+        prof_nombre = (f"{prof.first_name or ''} {prof.last_name or ''}".strip() or prof.username)
 
-        negocio = clinica.nombre if clinica else "Clínica"
-        monto = float(pago.monto_facturado or 0)
+        # =========================
+        # Totales
+        # =========================
+        costo_servicio = Decimal(cita.precio or 0)
+
+        monto_facturado = Decimal(cita.monto_final or 0) if Decimal(cita.monto_final or 0) > 0 else Decimal(pago.monto_facturado or 0)
+
+        descuento_pct = Decimal(cita.descuento_porcentaje or 0)
+        base_desc = Decimal(pago.monto_facturado or costo_servicio)
+        descuento_monto = (base_desc * descuento_pct) / Decimal("100")
+
+        total_a_pagar = Decimal(cita.monto_final or 0)
+        if total_a_pagar <= 0:
+            total_a_pagar = max(base_desc - descuento_monto, Decimal("0"))
+
+        pagos_qs = cita.pagos.all()
+        total_pagado = pagos_qs.aggregate(total=models.Sum("anticipo")).get("total") or Decimal("0")
+
+        restante = max(total_a_pagar - Decimal(total_pagado), Decimal("0"))
+
+        by_method = (
+            pagos_qs.values("metodo_pago")
+            .annotate(total=models.Sum("anticipo"))
+            .order_by("metodo_pago")
+        )
+
+        # =========================
+        # Ticket meta
+        # =========================
+        now = timezone.localtime(timezone.now())
+        fecha_emision = now.strftime("%Y-%m-%d")
+        hora_emision = now.strftime("%H:%M:%S")
+
+        venta_no = f"{cita.id}"
+        ticket_no = f"{pago.id}"
+
+        servicio_nombre = safe_str(getattr(cita.servicio, "nombre", "")) or "SERVICIO"
+
+        # =========================
+        # Layout ticket (80mm)
+        # =========================
+        ticket_width = 80 * mm
+        line_h = 4.0 * mm
+        top_pad = 8 * mm
+        bottom_pad = 8 * mm
+
+        sep = "-" * 32  # visual
+
+        # Calculamos alto aproximado por cantidad de líneas (incluyendo secciones extra)
+        # Importante: aquí ya no usamos "lines" para render directo, pero sí para medir alto.
+        header_lines = []
+        header_lines.append(up(negocio))
+        header_lines.append(up(f"RFC: {RFC_FIJO}"))
+        header_lines += split_chunks(direccion, 32)
+
+        ticket_info_lines = [
+            up(f"VENTA: {venta_no}  TICKET: {ticket_no}"),
+            up(f"EMISION: {fecha_emision} {hora_emision}"),
+        ]
+
+        cliente_lines = [up("CLIENTE")] + split_chunks(paciente_nombre, 32)
+        prof_lines = [up("PROFESIONAL")] + split_chunks(prof_nombre, 32)
+
+        detalle_lines = [
+            up("DETALLE"),
+            up(servicio_nombre[:32]),
+            up(sep),
+            "COSTO",
+            f"DESC ({descuento_pct}%)",
+            "MONTO FACTURADO",
+            up(sep),
+            "TOTAL A PAGAR",
+            "COBRADO",
+            "RESTANTE",
+            up(sep),
+            up("PAGOS POR METODO"),
+        ]
+
+        pagos_lines = []
+        if by_method:
+            for row in by_method:
+                mp = (row.get("metodo_pago") or "otro").strip()
+                mp_label = {
+                    "efectivo": "EFECTIVO",
+                    "tarjeta": "TARJETA",
+                    "transferencia": "TRANSFERENCIA",
+                    "otro": "OTRO",
+                }.get(mp, up(mp))
+                pagos_lines.append(mp_label)
+        else:
+            pagos_lines.append("SIN PAGOS REGISTRADOS")
+
+        footer_lines = [
+            up(sep),
+            up("GRACIAS POR SU PREFERENCIA"),
+            up("DOCUMENTO GENERADO POR EL SISTEMA"),
+        ]
+
+        # QR reserva de espacio (si existe)
+        qr_h = 0
+        qr_w = 0
+        has_qr = False
+        if qr_path:
+            try:
+                import os
+                if os.path.exists(str(qr_path)):
+                    has_qr = True
+                    qr_w = 18 * mm
+                    qr_h = 18 * mm
+            except Exception:
+                has_qr = False
+
+        # Logo reserva
+        logo_h = 0
+        has_logo = False
+        if logo_path:
+            try:
+                import os
+                if os.path.exists(str(logo_path)):
+                    has_logo = True
+                    logo_h = 18 * mm
+            except Exception:
+                has_logo = False
+
+        # Contamos líneas “reales” que se dibujan
+        # + pagosl ines (cada método = 1 línea)
+        total_text_lines = (
+            len(header_lines)
+            + 1  # sep
+            + len(ticket_info_lines)
+            + 1  # sep
+            + len(cliente_lines)
+            + len(prof_lines)
+            + 1  # sep
+            + 1  # DETALLE title (ya va en detalle_lines, pero contamos como texto)
+            + 1  # servicio
+            + 1  # sep
+            + 3  # costo/desc/monto
+            + 1  # sep
+            + 3  # total/cobrado/restante
+            + 1  # sep
+            + 1  # PAGOS POR METODO
+            + max(1, len(pagos_lines))
+            + len(footer_lines)
+        )
+
+        # Alto final (dejamos espacio extra por QR para que no se “encime”)
+        height = top_pad + bottom_pad + (total_text_lines * line_h) + logo_h + (qr_h if has_qr else 0) + (6 * mm)
 
         buffer = BytesIO()
-        c = canvas.Canvas(buffer, pagesize=letter)
-        w, h = letter
+        c = canvas.Canvas(buffer, pagesize=(ticket_width, height))
 
-        y = h - 60
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(50, y, "Ticket / Factura")
-        y -= 25
+        y = height - top_pad
 
-        c.setFont("Helvetica", 11)
-        c.drawString(50, y, f"Negocio: {negocio}")
-        y -= 18
-        c.drawString(50, y, f"Paciente: {paciente_nombre}")
-        y -= 18
-        c.drawString(50, y, f"Profesional: {prof_nombre}")
-        y -= 18
-        c.drawString(50, y, f"Fecha pago: {pago.fecha_pago.isoformat()}")
-        y -= 18
-        c.drawString(50, y, f"Método pago: {pago.metodo_pago}")
-        y -= 25
+        # =========================
+        # LOGO (centrado)
+        # =========================
+        if has_logo:
+            try:
+                img = ImageReader(str(logo_path))
+                draw_w = 60 * mm
+                draw_h = 18 * mm
+                x = (ticket_width - draw_w) / 2
+                c.drawImage(img, x, y - draw_h, width=draw_w, height=draw_h, preserveAspectRatio=True, mask="auto")
+                y -= (draw_h + 3 * mm)
+            except Exception:
+                pass
 
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(50, y, f"Total facturado: $ {monto:,.2f}")
-        y -= 30
+        # =========================
+        # HEADER CENTRADO
+        # =========================
+        c.setFont("Helvetica", 8.5)
 
-        c.setFont("Helvetica", 9)
-        c.drawString(50, y, "Documento generado por el sistema.")
-        y -= 14
+        draw_center(c, y, negocio, "Helvetica-Bold", 9)
+        y -= line_h
+
+        draw_center(c, y, f"RFC: {RFC_FIJO}", "Helvetica", 8.5)
+        y -= line_h
+
+        for line in split_chunks(direccion, 32):
+            draw_center(c, y, line, "Helvetica", 8.5)
+            y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        # =========================
+        # DATOS TICKET CENTRADOS
+        # =========================
+        draw_center(c, y, f"VENTA: {venta_no}  TICKET: {ticket_no}", "Helvetica", 8.5)
+        y -= line_h
+        draw_center(c, y, f"EMISION: {fecha_emision} {hora_emision}", "Helvetica", 8.5)
+        y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        # =========================
+        # CLIENTE / PROF CENTRADOS
+        # =========================
+        draw_center(c, y, "CLIENTE", "Helvetica-Bold", 8.5)
+        y -= line_h
+        for line in split_chunks(paciente_nombre, 32):
+            draw_center(c, y, line, "Helvetica", 8.5)
+            y -= line_h
+
+        y -= (1 * mm)
+
+        draw_center(c, y, "PROFESIONAL", "Helvetica-Bold", 8.5)
+        y -= line_h
+        for line in split_chunks(prof_nombre, 32):
+            draw_center(c, y, line, "Helvetica", 8.5)
+            y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        # =========================
+        # DETALLE (servicio centrado)
+        # =========================
+        draw_center(c, y, "DETALLE", "Helvetica-Bold", 8.5)
+        y -= line_h
+
+        for line in split_chunks(servicio_nombre[:64], 32):
+            draw_center(c, y, line, "Helvetica", 8.5)
+            y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        # COSTOS: etiqueta izquierda / monto derecha
+        draw_lr(c, y, "COSTO", money(costo_servicio))
+        y -= line_h
+        draw_lr(c, y, f"DESC ({descuento_pct}%)", f"-{money(descuento_monto)}")
+        y -= line_h
+        draw_lr(c, y, "MONTO FACTURADO", money(monto_facturado))
+        y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        draw_lr(c, y, "TOTAL A PAGAR", money(total_a_pagar))
+        y -= line_h
+        draw_lr(c, y, "COBRADO", money(total_pagado))
+        y -= line_h
+        draw_lr(c, y, "RESTANTE", money(restante))
+        y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        # =========================
+        # PAGOS POR METODO (monto a la derecha)
+        # =========================
+        draw_center(c, y, "PAGOS POR METODO", "Helvetica-Bold", 8.5)
+        y -= line_h
+
+        if by_method:
+            for row in by_method:
+                mp = (row.get("metodo_pago") or "otro").strip()
+                tot = row.get("total") or 0
+                mp_label = {
+                    "efectivo": "EFECTIVO",
+                    "tarjeta": "TARJETA",
+                    "transferencia": "TRANSFERENCIA",
+                    "otro": "OTRO",
+                }.get(mp, up(mp))
+
+                draw_lr(c, y, mp_label, money(tot))
+                y -= line_h
+        else:
+            draw_center(c, y, "SIN PAGOS REGISTRADOS", "Helvetica", 8.5)
+            y -= line_h
+
+        draw_center(c, y, sep, "Helvetica", 8.5)
+        y -= line_h
+
+        # =========================
+        # FOOTER centrado
+        # =========================
+        draw_center(c, y, "GRACIAS POR SU PREFERENCIA", "Helvetica-Bold", 8.5)
+        y -= line_h
+        draw_center(c, y, "DOCUMENTO GENERADO POR EL SISTEMA", "Helvetica", 8.0)
+        y -= line_h
+
+        # =========================
+        # QR abajo derecha
+        # =========================
+        if has_qr:
+            try:
+                img_qr = ImageReader(str(qr_path))
+                # pos: abajo derecha con padding
+                x_qr = ticket_width - 4 * mm - qr_w
+                y_qr = 4 * mm
+                c.drawImage(img_qr, x_qr, y_qr, width=qr_w, height=qr_h, preserveAspectRatio=True, mask="auto")
+            except Exception:
+                pass
 
         c.showPage()
         c.save()
@@ -427,11 +745,10 @@ class PagoViewSet(viewsets.ModelViewSet):
         pdf = buffer.getvalue()
         buffer.close()
 
-        filename = f"ticket_pago_{pago.id}.pdf"
+        filename = f"TICKET_VENTA_{venta_no}_PAGO_{ticket_no}.PDF"
         resp = HttpResponse(pdf, content_type="application/pdf")
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp
-
 
 # =========================
 # ====== PÚBLICO ==========
@@ -544,5 +861,119 @@ def me(request):
             "username": u.username,
             "full_name": full_name,
             "rol": role,
+        }
+    )
+
+class BloqueoHorarioViewSet(viewsets.ModelViewSet):
+    queryset = BloqueoHorario.objects.select_related("profesional").all()
+    serializer_class = BloqueoHorarioSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        role = _user_role(self.request.user)
+        qs = super().get_queryset()
+
+        # Profesional solo ve sus bloqueos
+        if _is_professional_role(role):
+            qs = qs.filter(profesional=self.request.user)
+
+        return qs
+
+class ServicioAdminViewSet(viewsets.ModelViewSet):
+    serializer_class = ServicioSerializer
+    permission_classes = [IsAdminUserStrict]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_queryset(self):
+        # Admin ve todo (activos e inactivos)
+        return Servicio.objects.all().order_by("-id")
+
+    def perform_create(self, serializer):
+        clinica = _first_clinica()
+        if not clinica:
+            raise ValidationError({"detail": "No existe clínica configurada."})
+        serializer.save(clinica=clinica)
+
+import re
+from rest_framework.parsers import MultiPartParser, FormParser
+
+def _password_fuerte(pw: str) -> bool:
+    if not pw or len(pw) < 8:
+        return False
+    if not re.search(r"[A-Z]", pw):
+        return False
+    if not re.search(r"[a-z]", pw):
+        return False
+    if not re.search(r"[0-9]", pw):
+        return False
+    if not re.search(r"[^A-Za-z0-9]", pw):
+        return False
+    return True
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def me_update(request):
+    """
+    Actualiza datos del usuario en sesión:
+    - username, first_name, last_name, email
+    - foto (StaffProfile)
+    - cambio de contraseña opcional:
+        requiere current_password + new_password fuerte
+    """
+    u = request.user
+
+    username = (request.data.get("username") or "").strip()
+    first_name = (request.data.get("first_name") or "").strip()
+    last_name = (request.data.get("last_name") or "").strip()
+    email = (request.data.get("email") or "").strip()
+
+    if not username:
+        return Response({"detail": "username requerido."}, status=400)
+    if not email:
+        return Response({"detail": "email requerido."}, status=400)
+
+    # ✅ si manda new_password, aplicar validación fuerte
+    new_password = request.data.get("new_password") or ""
+    current_password = request.data.get("current_password") or ""
+
+    if new_password:
+        if not current_password:
+            return Response({"detail": "Escribe tu contraseña actual para cambiarla."}, status=400)
+        if not u.check_password(current_password):
+            return Response({"detail": "La contraseña actual es incorrecta."}, status=400)
+        if not _password_fuerte(new_password):
+            return Response(
+                {"detail": "La nueva contraseña no cumple requisitos (8+, mayúscula, minúscula, número, símbolo)."},
+                status=400,
+            )
+        u.set_password(new_password)
+
+    u.username = username
+    u.first_name = first_name
+    u.last_name = last_name
+    u.email = email
+    u.save()
+
+    # ✅ foto en StaffProfile (si existe)
+    foto = request.FILES.get("foto", None)
+    sp = getattr(u, "staff_profile", None)
+    if sp and foto:
+        sp.foto = foto
+        sp.save(update_fields=["foto"])
+
+    role = _user_role(u)
+    full_name = (u.get_full_name() or "").strip() or u.username
+
+    # devolvemos lo que usa tu front
+    return Response(
+        {
+            "id": u.id,
+            "email": u.email,
+            "username": u.username,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "full_name": full_name,
+            "rol": role,
+            "foto_url": (request.build_absolute_uri(sp.foto.url) if (sp and sp.foto) else None),
         }
     )
