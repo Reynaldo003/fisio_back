@@ -116,23 +116,23 @@ WSGI_APPLICATION = 'fisionerv_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 DATABASES = {
-#    "default": {
-#        "ENGINE": "django.db.backends.postgresql",
-#        "NAME": "FisioNerv",
-#        "USER": "postgres",
-#        "PASSWORD": "1234",
-#        "HOST": "localhost",
-#       "PORT": "5432",
-#    },
-    
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "NAME": "fisionerv",
-        "USER": "mauricio",
-        "PASSWORD": "Rock1234",
-        "HOST": "127.0.0.1",
-        "PORT": "5432",
-    }
+        "NAME": "FisioNerv",
+        "USER": "postgres",
+        "PASSWORD": "1234",
+        "HOST": "localhost",
+       "PORT": "5432",
+    },
+    
+#    "default": {
+#        "ENGINE": "django.db.backends.postgresql",
+#        "NAME": "fisionerv",
+#        "USER": "mauricio",
+#        "PASSWORD": "Rock1234",
+#        "HOST": "127.0.0.1",
+#        "PORT": "5432",
+#    }
 }
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -150,6 +150,11 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+FRONT_BASE_URL = "http://localhost:5173"
+DEFAULT_FROM_EMAIL = "rvallejo276@gmail.com"
+
+# Para desarrollo: imprime correos en consola
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/

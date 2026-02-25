@@ -9,6 +9,8 @@ from .views import (
     StaffUserViewSet, me, BloqueoHorarioViewSet,
     ServicioAdminViewSet, me_update,
 )
+from django.urls import path
+from .views import password_reset_request, password_reset_confirm
 
 router = DefaultRouter()
 router.register("pacientes", PacienteViewSet, basename="pacientes")
@@ -34,4 +36,6 @@ urlpatterns = [
     path("public/agenda/", public_agenda, name="public-agenda"),
     path("public/citas/", public_create_cita, name="public-create-cita"),
     path("public/team/", public_team, name="public-team"),
+    path("auth/password-reset/", password_reset_request),
+    path("auth/password-reset-confirm/", password_reset_confirm),
 ]

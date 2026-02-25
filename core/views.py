@@ -13,6 +13,8 @@ from reportlab.lib.utils import ImageReader
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.http import HttpResponse
+from email.message import EmailMessage
+import smtplib
 
 from rest_framework import permissions, viewsets, status, mixins
 from rest_framework.decorators import action, api_view, permission_classes
@@ -37,7 +39,11 @@ from .serializers import (
 )
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from .permissions import IsAdminUserStrict
-
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils.encoding import force_bytes, force_str
+from django.core.mail import send_mail
+from django.db.models import Q
 
 # =========================
 # Helpers
@@ -352,7 +358,25 @@ class PagoViewSet(viewsets.ModelViewSet):
             qs = qs.filter(cita__profesional=self.request.user)
 
         return qs
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        cita = getattr(instance, "cita", None)
 
+        # si no hay cita (raro), elimina solo el pago
+        if not cita:
+            return super().destroy(request, *args, **kwargs)
+
+        try:
+            cita.delete()  # ✅ cascada: se llevan pagos
+        except Exception as exc:
+            print("[PAGOS] Error al eliminar cita relacionada:", repr(exc))
+            try:
+                instance.delete()
+            except Exception:
+                pass
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    
     @action(detail=True, methods=["get"], url_path="ticket", permission_classes=[IsAuthenticated])
     def ticket_pdf(self, request, pk=None):
         pago = self.get_object()
@@ -749,10 +773,25 @@ class PagoViewSet(viewsets.ModelViewSet):
         resp = HttpResponse(pdf, content_type="application/pdf")
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp
+    # dentro de class PagoViewSet(viewsets.ModelViewSet):
+    @action(detail=False, methods=["delete"], url_path=r"by-cita/(?P<cita_id>\d+)")
+    def delete_by_cita(self, request, cita_id=None):
+        """
+        DELETE /api/pagos/by-cita/<cita_id>/
+        Borra la CITA y por cascada borra TODOS los pagos (ventas) asociados.
+        """
+        cita = Cita.objects.filter(id=cita_id).first()
+        if not cita:
+            return Response(status=status.HTTP_204_NO_CONTENT)
 
-# =========================
-# ====== PÚBLICO ==========
-# =========================
+        try:
+            cita.delete()
+        except Exception as exc:
+            print("[PAGOS] Error borrando cita desde by-cita:", repr(exc))
+            return Response({"detail": "No se pudo eliminar."}, status=400)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    
 @api_view(["GET"])
 @permission_classes([permissions.AllowAny])
 def public_agenda(request):
@@ -768,14 +807,36 @@ def public_agenda(request):
     if not profesional:
         return Response({"detail": "No hay profesional configurado."}, status=400)
 
-    qs = (
+    qs_citas = (
         Cita.objects.filter(fecha=fecha, profesional=profesional)
         .exclude(estado="cancelado")
-        .only("hora_inicio")
+        .only("hora_inicio", "hora_termina")
     )
-    data = [{"hora_inicio": c.hora_inicio.strftime("%H:%M:%S")} for c in qs]
-    return Response(data)
 
+    qs_bloq = (
+        BloqueoHorario.objects.filter(fecha=fecha, profesional=profesional)
+        .only("hora_inicio", "hora_termina")
+    )
+
+    data = []
+    for c in qs_citas:
+        data.append(
+            {
+                "hora_inicio": c.hora_inicio.strftime("%H:%M:%S"),
+                "hora_termina": c.hora_termina.strftime("%H:%M:%S"),
+                "kind": "cita",
+            }
+        )
+    for b in qs_bloq:
+        data.append(
+            {
+                "hora_inicio": b.hora_inicio.strftime("%H:%M:%S"),
+                "hora_termina": b.hora_termina.strftime("%H:%M:%S"),
+                "kind": "bloqueo",
+            }
+        )
+
+    return Response(data)
 
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
@@ -832,7 +893,14 @@ def public_create_cita(request):
         exclude_id=None,
     ):
         return Response({"detail": "Horario ya ocupado."}, status=409)
-
+    # ✅ también validar contra bloqueos administrativos
+    bloqs = BloqueoHorario.objects.filter(fecha=fecha, profesional=profesional).only(
+        "hora_inicio", "hora_termina"
+    )
+    for b in bloqs:
+        if _overlaps(hi, ht, b.hora_inicio, b.hora_termina):
+            return Response({"detail": "Horario no disponible."}, status=409)
+        
     cita = Cita.objects.create(
         paciente=paciente,
         servicio=servicio,
@@ -977,3 +1045,102 @@ def me_update(request):
             "foto_url": (request.build_absolute_uri(sp.foto.url) if (sp and sp.foto) else None),
         }
     )
+# =========================
+# Password Reset (public)
+# =========================
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def password_reset_request(request):
+    """
+    POST { email_or_username }
+    - Siempre responde 200 (aunque no exista) para no filtrar usuarios.
+    - Si existe usuario con email válido, genera una contraseña temporal,
+      la guarda y envía correo usando Gmail (SMTP).
+    """
+    val = (request.data.get("email_or_username") or "").strip()
+    if not val:
+        return Response({"detail": "email_or_username requerido."}, status=400)
+
+    user = User.objects.filter(Q(email__iexact=val) | Q(username__iexact=val)).first()
+
+    ok_msg = {"detail": "Si existe el usuario, se envió el correo."}
+    if not user or not user.email:
+        return Response(ok_msg, status=200)
+
+    # 1) Generar password temporal
+    import secrets
+    import string
+
+    alphabet = string.ascii_letters + string.digits
+    raw_password = "Temp-" + "".join(secrets.choice(alphabet) for _ in range(10))
+
+    try:
+        user.set_password(raw_password)
+        user.save(update_fields=["password"])
+    except Exception as exc:
+        print("[PASSWORD RESET] Error guardando nueva contraseña:", repr(exc))
+        return Response(ok_msg, status=200)
+
+    # 2) Enviar correo por Gmail (SMTP)
+    REMITENTE = "workflow2709@gmail.com"  # ✅ constante
+    APP_PASSWORD = "gntx ppix dzkd cdxt"  # ✅ constante (App Password)
+
+    destinatario = "rvallejo276@gmail.com"  # ✅ solo desde BD
+    asunto = "Recuperación de contraseña - Fisionerv"
+    mensaje = (
+        "Se generó una contraseña temporal para tu cuenta.\n\n"
+        f"Usuario: {user.username}\n"
+        f"Contraseña temporal: {raw_password}\n\n"
+        "Por seguridad, al iniciar sesión cámbiala desde tu perfil."
+    )
+
+    try:
+        email = EmailMessage()
+        email["From"] = REMITENTE
+        email["To"] = destinatario
+        email["Subject"] = asunto
+        email.set_content(mensaje)
+
+        smtp = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+        smtp.login(REMITENTE, APP_PASSWORD)
+        smtp.send_message(email)
+        smtp.quit()
+    except Exception as exc:
+        print("[PASSWORD RESET] Error enviando email SMTP:", repr(exc))
+
+    return Response(ok_msg, status=200)
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def password_reset_confirm(request):
+    uid = request.data.get("uid") or ""
+    token = request.data.get("token") or ""
+    new_password = request.data.get("new_password") or ""
+
+    if not (uid and token and new_password):
+        return Response({"detail": "uid, token y new_password requeridos."}, status=400)
+
+    if not _password_fuerte(new_password):
+        return Response(
+            {"detail": "La nueva contraseña no cumple requisitos (8+, mayúscula, minúscula, número, símbolo)."},
+            status=400,
+        )
+
+    try:
+        user_id = force_str(urlsafe_base64_decode(uid))
+        user = User.objects.filter(pk=user_id).first()
+    except Exception:
+        user = None
+
+    if not user:
+        return Response({"detail": "Token inválido."}, status=400)
+
+    token_gen = PasswordResetTokenGenerator()
+    if not token_gen.check_token(user, token):
+        return Response({"detail": "Token inválido o expirado."}, status=400)
+
+    user.set_password(new_password)
+    user.save(update_fields=["password"])
+
+    return Response({"detail": "Contraseña actualizada correctamente."}, status=200)
