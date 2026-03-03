@@ -148,7 +148,8 @@ class ServicioSerializer(serializers.ModelSerializer):
     class Meta:
         model = Servicio
         fields = "__all__"
-
+        read_only_fields = ["clinica"]
+        
     def get_imagen_url(self, obj):
         request = self.context.get("request")
         if not obj.imagen:
