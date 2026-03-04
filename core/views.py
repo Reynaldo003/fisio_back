@@ -946,12 +946,6 @@ class BloqueoHorarioViewSet(viewsets.ModelViewSet):
             qs = qs.filter(profesional=self.request.user)
 
         return qs
-    
-def _clinica_de_usuario(user):
-    perfil = getattr(user, "perfil", None)
-    if perfil and perfil.clinica:
-        return perfil.clinica
-    return None
 
 class ServicioAdminViewSet(viewsets.ModelViewSet):
     serializer_class = ServicioSerializer
@@ -959,20 +953,14 @@ class ServicioAdminViewSet(viewsets.ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_queryset(self):
-        # opcional: filtra por clínica del usuario para multi-tenant
-        clinica = _clinica_de_usuario(self.request.user)
-        qs = Servicio.objects.all().order_by("-id")
-        return qs.filter(clinica=clinica) if clinica else qs.none()
+        # Admin ve todo (activos e inactivos)
+        return Servicio.objects.all().order_by("-id")
 
     def perform_create(self, serializer):
-        clinica = _clinica_de_usuario(self.request.user) or _first_clinica()
+        clinica = _first_clinica()
         if not clinica:
-            raise ValidationError({"clinica": "No tienes clínica asignada."})
+            raise ValidationError({"detail": "No existe clínica configurada."})
         serializer.save(clinica=clinica)
-
-    def perform_update(self, serializer):
-        # no dejes que cambien la clínica
-        serializer.save(clinica=serializer.instance.clinica)
 
 import re
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -1156,4 +1144,3 @@ def password_reset_confirm(request):
     user.save(update_fields=["password"])
 
     return Response({"detail": "Contraseña actualizada correctamente."}, status=200)
-

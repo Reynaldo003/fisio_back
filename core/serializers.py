@@ -148,8 +148,10 @@ class ServicioSerializer(serializers.ModelSerializer):
     class Meta:
         model = Servicio
         fields = "__all__"
-        read_only_fields = ["clinica"]
-        
+        extra_kwargs = {
+            "clinica": {"read_only": True},
+        }
+
     def get_imagen_url(self, obj):
         request = self.context.get("request")
         if not obj.imagen:
@@ -157,8 +159,6 @@ class ServicioSerializer(serializers.ModelSerializer):
         url = obj.imagen.url
         return request.build_absolute_uri(url) if request else url
         #return request.build_absolute_uri(obj.imagen.url) if request else obj.imagen.url
-
-
 
 class CitaSerializer(serializers.ModelSerializer):
     paciente_nombre = serializers.SerializerMethodField()
