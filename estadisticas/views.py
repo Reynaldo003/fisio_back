@@ -70,7 +70,8 @@ def estadisticas(request):
 
     # Rango inclusivo (para DateField es OK usar __range)
     citas_base = Cita.objects.filter(fecha__range=(from_q, to_q))
-    pagos_base = Pago.objects.filter(fecha_pago__range=(from_q, to_q))
+    #pagos_base = Pago.objects.filter(fecha_pago__range=(from_q, to_q))
+    pagos_base = Pago.objects.filter(cita__fecha__range=(from_q, to_q))
     pacientes_base = Paciente.objects.all()
 
     # filtro por profesional (afecta citas y pagos vía cita)
@@ -102,15 +103,11 @@ def estadisticas(request):
     # 3) Ventas realizadas (pagos) por periodo (cuenta de pagos y total cobrado)
     # =========================
     sales_series = (
-        pagos_base.annotate(period=trunc("fecha_pago"))
+        pagos_base.annotate(period=trunc("cita__fecha"))
         .values("period")
-        .annotate(
-            total_pagos=Count("id"),
-            total_cobrado=Sum("anticipo"),
-        )
+        .annotate(total_pagos=Count("id"), total_cobrado=Sum("anticipo"))
         .order_by("period")
     )
-
     # =========================
     # 4) Métodos de pago (por pagos)
     # =========================
@@ -137,7 +134,7 @@ def estadisticas(request):
     #     (si group != month, igual devolvemos mensual para ese gráfico)
     # =========================
     monthly_income = (
-        pagos_base.annotate(period=TruncMonth("fecha_pago"))
+        pagos_base.annotate(period=TruncMonth("cita__fecha"))
         .values("period")
         .annotate(total=Sum("anticipo"))
         .order_by("period")
