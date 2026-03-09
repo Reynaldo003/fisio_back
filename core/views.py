@@ -357,26 +357,61 @@ class PagoViewSet(viewsets.ModelViewSet):
         if _is_professional_role(role):
             qs = qs.filter(cita__profesional=self.request.user)
 
+        cita_id = self.request.query_params.get("cita")
+        if cita_id:
+            qs = qs.filter(cita_id=cita_id)
+
         return qs
+
+    def _recalcular_cita(self, cita):
+        from decimal import Decimal
+        from django.db.models import Sum
+
+        pagos_qs = cita.pagos.all()
+
+        total_pagado = pagos_qs.aggregate(total=Sum("anticipo")).get("total") or Decimal("0")
+
+        pago_base = pagos_qs.order_by("-fecha_pago", "-id").first()
+
+        if pago_base:
+            monto_facturado = Decimal(pago_base.monto_facturado or 0)
+            descuento_porcentaje = Decimal(pago_base.descuento_porcentaje or 0)
+        else:
+            monto_facturado = Decimal(cita.monto_final or cita.precio or 0)
+            descuento_porcentaje = Decimal(cita.descuento_porcentaje or 0)
+
+        descuento_monto = (monto_facturado * descuento_porcentaje) / Decimal("100")
+        total_con_descuento = max(monto_facturado - descuento_monto, Decimal("0"))
+        restante = max(total_con_descuento - total_pagado, Decimal("0"))
+
+        cita.descuento_porcentaje = descuento_porcentaje
+        cita.monto_final = total_con_descuento
+        cita.anticipo = total_pagado
+        cita.pagado = restante <= 0 and total_con_descuento > 0
+        cita.save(
+            update_fields=[
+                "descuento_porcentaje",
+                "monto_final",
+                "anticipo",
+                "pagado",
+                "actualizado",
+            ]
+        )
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         cita = getattr(instance, "cita", None)
 
-        # si no hay cita (raro), elimina solo el pago
-        if not cita:
-            return super().destroy(request, *args, **kwargs)
+        instance.delete()
 
-        try:
-            cita.delete()  # ✅ cascada: se llevan pagos
-        except Exception as exc:
-            print("[PAGOS] Error al eliminar cita relacionada:", repr(exc))
+        if cita:
             try:
-                instance.delete()
-            except Exception:
-                pass
+                self._recalcular_cita(cita)
+            except Exception as exc:
+                print("[PAGOS] Error recalculando cita tras eliminar pago:", repr(exc))
 
         return Response(status=status.HTTP_204_NO_CONTENT)
-    
+
     @action(detail=True, methods=["get"], url_path="ticket", permission_classes=[IsAuthenticated])
     def ticket_pdf(self, request, pk=None):
         pago = self.get_object()
@@ -385,12 +420,8 @@ class PagoViewSet(viewsets.ModelViewSet):
 
         RFC_FIJO = "MECE000513F74"
 
-        # =========================
-        # Paths en MEDIA
-        # =========================
         def media_path(filename: str):
             try:
-                # settings.MEDIA_ROOT puede ser str o Path
                 return (settings.MEDIA_ROOT / filename) if hasattr(settings, "MEDIA_ROOT") else None
             except Exception:
                 return None
@@ -398,9 +429,6 @@ class PagoViewSet(viewsets.ModelViewSet):
         logo_path = media_path("fisionerv.png")
         qr_path = media_path("qr.png")
 
-        # =========================
-        # Helpers
-        # =========================
         def up(s: str) -> str:
             return (s or "").strip().upper()
 
@@ -415,9 +443,6 @@ class PagoViewSet(viewsets.ModelViewSet):
                 return "$ 0.00"
 
         def split_chunks(text: str, width_chars: int):
-            """
-            Parte texto en segmentos de longitud fija (simple y robusto para tickets).
-            """
             t = up(text)
             if not t:
                 return []
@@ -429,7 +454,6 @@ class PagoViewSet(viewsets.ModelViewSet):
                 out.append(t)
             return out
 
-        # Dibujo centrado (por ancho real del string)
         def draw_center(c, y, text, font="Helvetica", size=8.5):
             c.setFont(font, size)
             t = up(text)
@@ -437,7 +461,6 @@ class PagoViewSet(viewsets.ModelViewSet):
             x = (ticket_width - w) / 2
             c.drawString(max(2 * mm, x), y, t)
 
-        # Dibujo "label izquierda" y "valor derecha"
         def draw_lr(c, y, left, right, font="Helvetica", size=8.5):
             c.setFont(font, size)
             l = up(left)
@@ -446,16 +469,11 @@ class PagoViewSet(viewsets.ModelViewSet):
             x_left = 4 * mm
             x_right = ticket_width - 4 * mm
 
-            # Izquierda
             c.drawString(x_left, y, l)
 
-            # Derecha (alineado a la derecha)
             rw = c.stringWidth(r, font, size)
             c.drawString(x_right - rw, y, r)
 
-        # =========================
-        # Datos negocio / personas
-        # =========================
         negocio = safe_str(getattr(clinica, "nombre", "")) or "FISIONERV"
         direccion = safe_str(getattr(clinica, "direccion", "")) or "DIRECCION NO CONFIGURADA"
 
@@ -465,11 +483,7 @@ class PagoViewSet(viewsets.ModelViewSet):
         prof = cita.profesional
         prof_nombre = (f"{prof.first_name or ''} {prof.last_name or ''}".strip() or prof.username)
 
-        # =========================
-        # Totales
-        # =========================
         costo_servicio = Decimal(cita.precio or 0)
-
         monto_facturado = Decimal(cita.monto_final or 0) if Decimal(cita.monto_final or 0) > 0 else Decimal(pago.monto_facturado or 0)
 
         descuento_pct = Decimal(cita.descuento_porcentaje or 0)
@@ -482,7 +496,6 @@ class PagoViewSet(viewsets.ModelViewSet):
 
         pagos_qs = cita.pagos.all()
         total_pagado = pagos_qs.aggregate(total=models.Sum("anticipo")).get("total") or Decimal("0")
-
         restante = max(total_a_pagar - Decimal(total_pagado), Decimal("0"))
 
         by_method = (
@@ -491,10 +504,8 @@ class PagoViewSet(viewsets.ModelViewSet):
             .order_by("metodo_pago")
         )
 
-        # =========================
-        # Ticket meta
-        # =========================
-        now = timezone.localtime(timezone.now())
+        #now = timezone.localtime(timezone.now())
+        now = timezone.now()
         fecha_emision = now.strftime("%Y-%m-%d")
         hora_emision = now.strftime("%H:%M:%S")
 
@@ -503,18 +514,13 @@ class PagoViewSet(viewsets.ModelViewSet):
 
         servicio_nombre = safe_str(getattr(cita.servicio, "nombre", "")) or "SERVICIO"
 
-        # =========================
-        # Layout ticket (80mm)
-        # =========================
         ticket_width = 80 * mm
         line_h = 4.0 * mm
         top_pad = 8 * mm
         bottom_pad = 8 * mm
 
-        sep = "-" * 32  # visual
+        sep = "-" * 32
 
-        # Calculamos alto aproximado por cantidad de líneas (incluyendo secciones extra)
-        # Importante: aquí ya no usamos "lines" para render directo, pero sí para medir alto.
         header_lines = []
         header_lines.append(up(negocio))
         header_lines.append(up(f"RFC: {RFC_FIJO}"))
@@ -527,21 +533,6 @@ class PagoViewSet(viewsets.ModelViewSet):
 
         cliente_lines = [up("CLIENTE")] + split_chunks(paciente_nombre, 32)
         prof_lines = [up("PROFESIONAL")] + split_chunks(prof_nombre, 32)
-
-        detalle_lines = [
-            up("DETALLE"),
-            up(servicio_nombre[:32]),
-            up(sep),
-            "COSTO",
-            f"DESC ({descuento_pct}%)",
-            "MONTO FACTURADO",
-            up(sep),
-            "TOTAL A PAGAR",
-            "COBRADO",
-            "RESTANTE",
-            up(sep),
-            up("PAGOS POR METODO"),
-        ]
 
         pagos_lines = []
         if by_method:
@@ -563,7 +554,6 @@ class PagoViewSet(viewsets.ModelViewSet):
             up("DOCUMENTO GENERADO POR EL SISTEMA"),
         ]
 
-        # QR reserva de espacio (si existe)
         qr_h = 0
         qr_w = 0
         has_qr = False
@@ -577,7 +567,6 @@ class PagoViewSet(viewsets.ModelViewSet):
             except Exception:
                 has_qr = False
 
-        # Logo reserva
         logo_h = 0
         has_logo = False
         if logo_path:
@@ -589,29 +578,26 @@ class PagoViewSet(viewsets.ModelViewSet):
             except Exception:
                 has_logo = False
 
-        # Contamos líneas “reales” que se dibujan
-        # + pagosl ines (cada método = 1 línea)
         total_text_lines = (
             len(header_lines)
-            + 1  # sep
+            + 1
             + len(ticket_info_lines)
-            + 1  # sep
+            + 1
             + len(cliente_lines)
             + len(prof_lines)
-            + 1  # sep
-            + 1  # DETALLE title (ya va en detalle_lines, pero contamos como texto)
-            + 1  # servicio
-            + 1  # sep
-            + 3  # costo/desc/monto
-            + 1  # sep
-            + 3  # total/cobrado/restante
-            + 1  # sep
-            + 1  # PAGOS POR METODO
+            + 1
+            + 1
+            + 1
+            + 1
+            + 3
+            + 1
+            + 3
+            + 1
+            + 1
             + max(1, len(pagos_lines))
             + len(footer_lines)
         )
 
-        # Alto final (dejamos espacio extra por QR para que no se “encime”)
         height = top_pad + bottom_pad + (total_text_lines * line_h) + logo_h + (qr_h if has_qr else 0) + (6 * mm)
 
         buffer = BytesIO()
@@ -619,9 +605,6 @@ class PagoViewSet(viewsets.ModelViewSet):
 
         y = height - top_pad
 
-        # =========================
-        # LOGO (centrado)
-        # =========================
         if has_logo:
             try:
                 img = ImageReader(str(logo_path))
@@ -633,9 +616,6 @@ class PagoViewSet(viewsets.ModelViewSet):
             except Exception:
                 pass
 
-        # =========================
-        # HEADER CENTRADO
-        # =========================
         c.setFont("Helvetica", 8.5)
 
         draw_center(c, y, negocio, "Helvetica-Bold", 9)
@@ -651,9 +631,6 @@ class PagoViewSet(viewsets.ModelViewSet):
         draw_center(c, y, sep, "Helvetica", 8.5)
         y -= line_h
 
-        # =========================
-        # DATOS TICKET CENTRADOS
-        # =========================
         draw_center(c, y, f"VENTA: {venta_no}  TICKET: {ticket_no}", "Helvetica", 8.5)
         y -= line_h
         draw_center(c, y, f"EMISION: {fecha_emision} {hora_emision}", "Helvetica", 8.5)
@@ -662,9 +639,6 @@ class PagoViewSet(viewsets.ModelViewSet):
         draw_center(c, y, sep, "Helvetica", 8.5)
         y -= line_h
 
-        # =========================
-        # CLIENTE / PROF CENTRADOS
-        # =========================
         draw_center(c, y, "CLIENTE", "Helvetica-Bold", 8.5)
         y -= line_h
         for line in split_chunks(paciente_nombre, 32):
@@ -682,9 +656,6 @@ class PagoViewSet(viewsets.ModelViewSet):
         draw_center(c, y, sep, "Helvetica", 8.5)
         y -= line_h
 
-        # =========================
-        # DETALLE (servicio centrado)
-        # =========================
         draw_center(c, y, "DETALLE", "Helvetica-Bold", 8.5)
         y -= line_h
 
@@ -695,7 +666,6 @@ class PagoViewSet(viewsets.ModelViewSet):
         draw_center(c, y, sep, "Helvetica", 8.5)
         y -= line_h
 
-        # COSTOS: etiqueta izquierda / monto derecha
         draw_lr(c, y, "COSTO", money(costo_servicio))
         y -= line_h
         draw_lr(c, y, f"DESC ({descuento_pct}%)", f"-{money(descuento_monto)}")
@@ -716,9 +686,6 @@ class PagoViewSet(viewsets.ModelViewSet):
         draw_center(c, y, sep, "Helvetica", 8.5)
         y -= line_h
 
-        # =========================
-        # PAGOS POR METODO (monto a la derecha)
-        # =========================
         draw_center(c, y, "PAGOS POR METODO", "Helvetica-Bold", 8.5)
         y -= line_h
 
@@ -742,21 +709,14 @@ class PagoViewSet(viewsets.ModelViewSet):
         draw_center(c, y, sep, "Helvetica", 8.5)
         y -= line_h
 
-        # =========================
-        # FOOTER centrado
-        # =========================
         draw_center(c, y, "GRACIAS POR SU PREFERENCIA", "Helvetica-Bold", 8.5)
         y -= line_h
         draw_center(c, y, "DOCUMENTO GENERADO POR EL SISTEMA", "Helvetica", 8.0)
         y -= line_h
 
-        # =========================
-        # QR abajo derecha
-        # =========================
         if has_qr:
             try:
                 img_qr = ImageReader(str(qr_path))
-                # pos: abajo derecha con padding
                 x_qr = ticket_width - 4 * mm - qr_w
                 y_qr = 4 * mm
                 c.drawImage(img_qr, x_qr, y_qr, width=qr_w, height=qr_h, preserveAspectRatio=True, mask="auto")
@@ -773,25 +733,26 @@ class PagoViewSet(viewsets.ModelViewSet):
         resp = HttpResponse(pdf, content_type="application/pdf")
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp
-    # dentro de class PagoViewSet(viewsets.ModelViewSet):
+
     @action(detail=False, methods=["delete"], url_path=r"by-cita/(?P<cita_id>\d+)")
     def delete_by_cita(self, request, cita_id=None):
         """
         DELETE /api/pagos/by-cita/<cita_id>/
-        Borra la CITA y por cascada borra TODOS los pagos (ventas) asociados.
+        Borra TODOS los pagos de la cita, pero NO borra la cita.
         """
         cita = Cita.objects.filter(id=cita_id).first()
         if not cita:
             return Response(status=status.HTTP_204_NO_CONTENT)
 
         try:
-            cita.delete()
+            cita.pagos.all().delete()
+            self._recalcular_cita(cita)
         except Exception as exc:
-            print("[PAGOS] Error borrando cita desde by-cita:", repr(exc))
+            print("[PAGOS] Error borrando pagos por cita:", repr(exc))
             return Response({"detail": "No se pudo eliminar."}, status=400)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
-    
+        
 @api_view(["GET"])
 @permission_classes([permissions.AllowAny])
 def public_agenda(request):
