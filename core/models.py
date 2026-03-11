@@ -1,4 +1,5 @@
 # core/models.py
+import uuid
 from django.conf import settings
 from django.db import models
 from django.contrib.auth.models import User
@@ -115,6 +116,13 @@ class Paciente(models.Model):
         ("alta", "Dado de alta"),
     ]
 
+    uuid = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        db_index=True,
+    )
+
     clinica = models.ForeignKey(
         Clinica,
         on_delete=models.CASCADE,
@@ -125,24 +133,29 @@ class Paciente(models.Model):
     apellido_mat = models.CharField(max_length=40, blank=True)
     fecha_nac = models.DateField(null=True, blank=True)
     genero = models.CharField(max_length=30, blank=True)
-    telefono = models.CharField(max_length=20)
+    telefono = models.CharField(max_length=20, blank=True, default="")
     correo = models.EmailField(max_length=100, blank=True)
     molestia = models.CharField(max_length=100, blank=True)
     notas = models.CharField(max_length=200, blank=True)
     registro = models.DateField(auto_now_add=True)
 
-    # ✅ NUEVO: estado actual del paciente
     estado_tratamiento = models.CharField(
         max_length=20,
         choices=ESTADO_TRATAMIENTO,
         default="en_tratamiento",
     )
-    # ✅ NUEVO: fecha de alta (para tus gráficas)
     fecha_alta = models.DateField(null=True, blank=True)
 
-    def __str__(self):
-        return f"{self.nombres} {self.apellido_pat}"
+    class Meta:
+        indexes = [
+            models.Index(fields=["clinica", "telefono"]),
+            models.Index(fields=["clinica", "apellido_pat", "apellido_mat"]),
+            models.Index(fields=["clinica", "nombres"]),
+        ]
+        ordering = ["-id"]
 
+    def __str__(self):
+        return f"{self.nombres} {self.apellido_pat}".strip()
 
 class Comentario(models.Model):
     clinica = models.ForeignKey(

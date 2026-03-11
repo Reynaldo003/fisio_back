@@ -52,18 +52,49 @@ PUBLIC_DEFAULT_PRO_NAME = "l.f.t edgar mauricio medina cruz"
 
 
 def _normalize_name(s: str) -> str:
-    """
-    Normaliza un nombre:
-    - lower
-    - sin acentos
-    - espacios compactados
-    """
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # quita acentos
     s = " ".join(s.split())
     return s
 
+def _normalize_phone(s: str) -> str:
+    return "".join(ch for ch in str(s or "") if ch.isdigit())
+
+def _full_name_paciente(paciente: Paciente) -> str:
+    return " ".join(
+        part.strip()
+        for part in [paciente.nombres, paciente.apellido_pat, paciente.apellido_mat]
+        if (part or "").strip()
+    ).strip()
+
+def _buscar_paciente_publico_similar(*, clinica: Clinica, nombre: str, telefono: str):
+    nombre_norm = _normalize_name(nombre)
+    telefono_norm = _normalize_phone(telefono)
+
+    if not nombre_norm or not telefono_norm:
+        return None
+
+    candidatos = Paciente.objects.filter(clinica=clinica).only(
+        "id",
+        "nombres",
+        "apellido_pat",
+        "apellido_mat",
+        "telefono",
+    )
+
+    for paciente in candidatos:
+        tel_actual = _normalize_phone(paciente.telefono)
+        if tel_actual != telefono_norm:
+            continue
+
+        nombre_completo = _normalize_name(_full_name_paciente(paciente))
+        solo_nombres = _normalize_name(paciente.nombres)
+
+        if nombre_completo == nombre_norm or solo_nombres == nombre_norm:
+            return paciente
+
+    return None
 
 def _user_role(user):
     if not user or not user.is_authenticated:
@@ -821,27 +852,35 @@ def public_create_cita(request):
 
     hora_inicio_full = f"{hora_inicio}:00" if len(hora_inicio) == 5 else hora_inicio
 
-    paciente, _ = Paciente.objects.get_or_create(
+    paciente = _buscar_paciente_publico_similar(
         clinica=clinica,
+        nombre=nombre,
         telefono=telefono,
-        defaults={
-            "nombres": nombre,
-            "apellido_pat": "",
-            "apellido_mat": "",
-            "fecha_nac": None,
-            "genero": "",
-            "correo": "",
-            "molestia": "",
-            "notas": "",
-        },
     )
 
-    # ✅ PROFESIONAL DEFAULT: Edgar Mauricio Medina Cruz (fallback a clinica.propietario)
+    if not paciente:
+        paciente = Paciente.objects.create(
+            clinica=clinica,
+            nombres=nombre,
+            apellido_pat="",
+            apellido_mat="",
+            fecha_nac=None,
+            genero="",
+            telefono=telefono,
+            correo="",
+            molestia="",
+            notas="",
+        )
+
     profesional = _default_public_professional(clinica)
     if not profesional:
         return Response({"detail": "No hay profesional configurado."}, status=400)
 
-    hora_termina = _calc_hora_termina(fecha, hora_inicio_full, servicio.duracion).strftime("%H:%M:%S")
+    hora_termina = _calc_hora_termina(
+        fecha,
+        hora_inicio_full,
+        servicio.duracion,
+    ).strftime("%H:%M:%S")
 
     hi = datetime.strptime(hora_inicio_full, "%H:%M:%S").time()
     ht = datetime.strptime(hora_termina, "%H:%M:%S").time()
@@ -854,14 +893,16 @@ def public_create_cita(request):
         exclude_id=None,
     ):
         return Response({"detail": "Horario ya ocupado."}, status=409)
-    # ✅ también validar contra bloqueos administrativos
-    bloqs = BloqueoHorario.objects.filter(fecha=fecha, profesional=profesional).only(
-        "hora_inicio", "hora_termina"
-    )
+
+    bloqs = BloqueoHorario.objects.filter(
+        fecha=fecha,
+        profesional=profesional,
+    ).only("hora_inicio", "hora_termina")
+
     for b in bloqs:
         if _overlaps(hi, ht, b.hora_inicio, b.hora_termina):
             return Response({"detail": "Horario no disponible."}, status=409)
-        
+
     cita = Cita.objects.create(
         paciente=paciente,
         servicio=servicio,
@@ -875,7 +916,6 @@ def public_create_cita(request):
     )
 
     return Response(CitaSerializer(cita).data, status=201)
-
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])

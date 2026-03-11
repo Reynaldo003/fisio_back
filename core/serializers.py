@@ -106,17 +106,22 @@ class UserSerializer(serializers.ModelSerializer):
         if obj.is_superuser or obj.is_staff:
             return "admin"
         return "colaborador"
-
+    
 class PacienteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Paciente
         fields = "__all__"
-
+        read_only_fields = ["id", "uuid", "registro"]
 
 class PacienteInlineSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)
+    uuid = serializers.UUIDField(required=False)
+
     class Meta:
         model = Paciente
         fields = [
+            "id",
+            "uuid",
             "nombres",
             "apellido_pat",
             "apellido_mat",
@@ -127,7 +132,6 @@ class PacienteInlineSerializer(serializers.ModelSerializer):
             "molestia",
             "notas",
         ]
-
 
 class ComentarioSerializer(serializers.ModelSerializer):
     class Meta:
@@ -181,14 +185,17 @@ class CitaSerializer(serializers.ModelSerializer):
         return full or u.username
 
 
-# core/serializers.py  (solo la parte del CitaCreateSerializer)
 class CitaCreateSerializer(serializers.ModelSerializer):
     paciente = PacienteInlineSerializer()
+    paciente_id = serializers.IntegerField(required=False, write_only=True)
+    paciente_uuid = serializers.UUIDField(required=False, write_only=True)
 
     class Meta:
         model = Cita
         fields = [
             "paciente",
+            "paciente_id",
+            "paciente_uuid",
             "servicio",
             "profesional",
             "fecha",
@@ -198,34 +205,44 @@ class CitaCreateSerializer(serializers.ModelSerializer):
             "metodo_pago",
             "estado",
             "notas",
-
-            # ✅ IMPORTANTES para pagos
             "pagado",
             "descuento_porcentaje",
             "anticipo",
             "monto_final",
         ]
 
+    def _resolver_paciente_existente(self, clinica, paciente_data):
+        paciente_id = self.initial_data.get("paciente_id") or paciente_data.get("id")
+        paciente_uuid = self.initial_data.get("paciente_uuid") or paciente_data.get("uuid")
+
+        if paciente_id:
+            return Paciente.objects.filter(clinica=clinica, id=paciente_id).first()
+
+        if paciente_uuid:
+            return Paciente.objects.filter(clinica=clinica, uuid=paciente_uuid).first()
+
+        return None
+
     def create(self, validated_data):
-        paciente_data = validated_data.pop("paciente")
-        telefono = paciente_data.get("telefono")
-        correo = paciente_data.get("correo")
+        paciente_data = validated_data.pop("paciente", {})
         clinica = self.context["clinica"]
 
-        paciente, _ = Paciente.objects.get_or_create(
-            clinica=clinica,
-            telefono=telefono,
-            defaults={
-                "nombres": paciente_data.get("nombres", ""),
-                "apellido_pat": paciente_data.get("apellido_pat", ""),
-                "apellido_mat": paciente_data.get("apellido_mat", ""),
-                "fecha_nac": paciente_data.get("fecha_nac"),
-                "genero": paciente_data.get("genero", ""),
-                "correo": correo or "",
-                "molestia": paciente_data.get("molestia", ""),
-                "notas": paciente_data.get("notas", ""),
-            },
-        )
+        paciente = self._resolver_paciente_existente(clinica, paciente_data)
+
+        if not paciente:
+            paciente = Paciente.objects.create(
+                clinica=clinica,
+                nombres=paciente_data.get("nombres", "").strip(),
+                apellido_pat=paciente_data.get("apellido_pat", "").strip(),
+                apellido_mat=paciente_data.get("apellido_mat", "").strip(),
+                fecha_nac=paciente_data.get("fecha_nac"),
+                genero=paciente_data.get("genero", "").strip(),
+                telefono=paciente_data.get("telefono", "").strip(),
+                correo=paciente_data.get("correo", "").strip(),
+                molestia=paciente_data.get("molestia", "").strip(),
+                notas=paciente_data.get("notas", "").strip(),
+            )
+
         return Cita.objects.create(paciente=paciente, **validated_data)
 
 class PagoSerializer(serializers.ModelSerializer):

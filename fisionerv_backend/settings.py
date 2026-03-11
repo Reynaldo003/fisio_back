@@ -116,22 +116,22 @@ WSGI_APPLICATION = 'fisionerv_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "FisioNerv",
-        "USER": "postgres",
-        "PASSWORD": "1234",
-        "HOST": "localhost",
-       "PORT": "5432",
-    },    
-#   "default": {
+#    "default": {
 #        "ENGINE": "django.db.backends.postgresql",
-#        "NAME": "fisionerv",
-#        "USER": "mauricio",
-#        "PASSWORD": "Rock1234",
-#        "HOST": "127.0.0.1",
-#        "PORT": "5432",
-#    }
+#        "NAME": "FisioNerv",
+#        "USER": "postgres",
+#        "PASSWORD": "1234",
+#        "HOST": "localhost",
+#       "PORT": "5432",
+#    },    
+   "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "fisionerv",
+        "USER": "mauricio",
+        "PASSWORD": "Rock1234",
+        "HOST": "127.0.0.1",
+        "PORT": "5432",
+    }
 }
 
 AUTH_PASSWORD_VALIDATORS = [
