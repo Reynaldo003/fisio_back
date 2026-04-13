@@ -407,6 +407,45 @@ class PagoViewSet(viewsets.ModelViewSet):
         if pago_base:
             monto_facturado = Decimal(pago_base.monto_facturado or 0)
             descuento_porcentaje = Decimal(pago_base.descuento_porcentaje or 0)
+            metodo_pago = pago_base.metodo_pago or ""
+        else:
+            monto_facturado = Decimal(cita.precio or 0)
+            descuento_porcentaje = Decimal(cita.descuento_porcentaje or 0)
+            metodo_pago = ""
+
+        descuento_monto = (monto_facturado * descuento_porcentaje) / Decimal("100")
+        total_con_descuento = max(monto_facturado - descuento_monto, Decimal("0"))
+        restante = max(total_con_descuento - total_pagado, Decimal("0"))
+
+        cita.descuento_porcentaje = descuento_porcentaje
+        cita.monto_final = total_con_descuento
+        cita.anticipo = total_pagado
+        cita.pagado = restante <= 0 and total_con_descuento > 0
+        cita.metodo_pago = metodo_pago
+        cita.save(
+            update_fields=[
+                "descuento_porcentaje",
+                "monto_final",
+                "anticipo",
+                "pagado",
+                "metodo_pago",
+                "actualizado",
+            ]
+        )
+        
+    def _recalcular_cita(self, cita):
+        from decimal import Decimal
+        from django.db.models import Sum
+
+        pagos_qs = cita.pagos.all()
+
+        total_pagado = pagos_qs.aggregate(total=Sum("anticipo")).get("total") or Decimal("0")
+
+        pago_base = pagos_qs.order_by("-fecha_pago", "-id").first()
+
+        if pago_base:
+            monto_facturado = Decimal(pago_base.monto_facturado or 0)
+            descuento_porcentaje = Decimal(pago_base.descuento_porcentaje or 0)
         else:
             monto_facturado = Decimal(cita.monto_final or cita.precio or 0)
             descuento_porcentaje = Decimal(cita.descuento_porcentaje or 0)
