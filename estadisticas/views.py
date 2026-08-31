@@ -1,3 +1,4 @@
+#estadisticas/views.py
 from datetime import date, datetime, timedelta
 
 from django.db.models import Count, Sum, F, Case, When, DecimalField, Value

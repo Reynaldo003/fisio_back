@@ -47,8 +47,6 @@ INSTALLED_APPS = [
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:3000",
     "https://fisionerv.cloud",
     "http://fisionerv.cloud",
     "https://api.fisionerv.cloud",
@@ -116,22 +114,22 @@ WSGI_APPLICATION = 'fisionerv_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 DATABASES = {
-#    "default": {
-#        "ENGINE": "django.db.backends.postgresql",
-#        "NAME": "FisioNerv",
-#        "USER": "postgres",
-#        "PASSWORD": "1234",
-#        "HOST": "localhost",
-#       "PORT": "5432",
-#    },    
-   "default": {
+    "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "NAME": "fisionerv",
-        "USER": "mauricio",
-        "PASSWORD": "Rock1234",
-        "HOST": "127.0.0.1",
-        "PORT": "5432",
-    }
+        "NAME": "FisioNerv",
+        "USER": "postgres",
+        "PASSWORD": "1234",
+        "HOST": "localhost",
+       "PORT": "5432",
+    },    
+#   "default": {
+#        "ENGINE": "django.db.backends.postgresql",
+#        "NAME": "fisionerv",
+#        "USER": "mauricio",
+#        "PASSWORD": "Rock1234",
+#        "HOST": "127.0.0.1",
+#        "PORT": "5432",
+#    }
 }
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -172,3 +170,5 @@ USE_TZ = False
 STATIC_URL = 'static/'
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+DEFAULT_AUTO_FIELD = "django.db.models.AutoField"

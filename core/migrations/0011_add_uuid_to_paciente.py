@@ -12,7 +12,7 @@ def poblar_uuid_pacientes(apps, schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("core", "00XX_MIGRACION_ANTERIOR"),
+        ("core", "0010_servicio_imagen"),
     ]
 
     operations = [
