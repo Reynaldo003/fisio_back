@@ -6,8 +6,7 @@ from core.models import Pago
 
 class PagoSerializer(serializers.ModelSerializer):
     paciente_nombre = serializers.SerializerMethodField(read_only=True); servicio_nombre = serializers.CharField(source="cita.servicio.nombre", read_only=True)
-    profesional_id = serializers.IntegerField(source="cita.profesional_id", read_only=True); profesional_nombre = serializers.SerializerMethodField(read_only=True)
-    fecha_cita = serializers.DateField(source="cita.fecha", read_only=True); restante = serializers.DecimalField(max_digits=8, decimal_places=2, read_only=True)
+    profesional_id = serializers.IntegerField(source="cita.profesional_id", read_only=True); profesional_nombre = serializers.SerializerMethodField(read_only=True); fecha_cita = serializers.DateField(source="cita.fecha", read_only=True); restante = serializers.DecimalField(max_digits=8, decimal_places=2, read_only=True)
 
     class Meta:
         model = Pago

@@ -1,84 +1,686 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
 from django.contrib.auth.models import User
+from django.db.models import Count, Sum
+from django.utils.dateparse import parse_date
 from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from core.models import BloqueoHorario, Cita, Paciente, Servicio
-from core.serializers.agenda import BloqueoHorarioSerializer, CitaCreateSerializer, CitaSerializer
-from core.utilidades import buscar_paciente_publico_similar, calcular_hora_termina, es_profesional, primera_clinica, profesional_publico_default, puede_ver_todas_agendas, rol_usuario, se_superponen, validar_conflicto_cita
+
+from core.models import (
+    BloqueoHorario,
+    Cita,
+    MetaDiariaConsulta,
+    Paciente,
+    Pago,
+    Servicio,
+)
+from core.serializers.agenda import (
+    BloqueoHorarioSerializer,
+    CitaCreateSerializer,
+    CitaSerializer,
+)
+from core.utilidades import (
+    buscar_paciente_publico_similar,
+    calcular_hora_termina,
+    clinica_usuario,
+    es_admin,
+    primera_clinica,
+    profesional_publico_default,
+    puede_modificar_dinero,
+    puede_ver_dinero,
+    puede_ver_todas_agendas,
+    permisos_usuario,
+    rol_usuario,
+    se_superponen,
+    validar_conflicto_cita,
+)
+
+
+DEFAULT_DAILY_GOAL = 60
+CAMPOS_DINERO_CITA = {
+    "precio",
+    "pagado",
+    "metodo_pago",
+    "descuento_porcentaje",
+    "anticipo",
+    "monto_final",
+}
+
+
+def nombre_usuario(user):
+    if not user:
+        return ""
+    return (user.get_full_name() or "").strip() or user.username
+
+
+def nombre_paciente(paciente):
+    if not paciente:
+        return ""
+    return (
+        f"{paciente.nombres} {paciente.apellido_pat} "
+        f"{paciente.apellido_mat or ''}"
+    ).strip()
+
+
+def dias_hasta_cumple(fecha_nacimiento, referencia):
+    if not fecha_nacimiento:
+        return None
+
+    try:
+        proximo = fecha_nacimiento.replace(year=referencia.year)
+    except ValueError:
+        proximo = date(referencia.year, 2, 28)
+
+    if proximo < referencia:
+        try:
+            proximo = fecha_nacimiento.replace(year=referencia.year + 1)
+        except ValueError:
+            proximo = date(referencia.year + 1, 2, 28)
+
+    return (proximo - referencia).days
 
 
 class CitaViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
-    def get_queryset(self):
-        rol = rol_usuario(self.request.user); qs = Cita.objects.select_related("paciente", "servicio", "profesional").order_by("fecha", "hora_inicio")
-        if es_profesional(rol): qs = qs.filter(profesional=self.request.user)
+    def _rol(self):
+        return rol_usuario(self.request.user)
+
+    def _profesional_filtro(self):
+        rol = self._rol()
+
+        if not puede_ver_todas_agendas(rol):
+            return self.request.user
+
+        profesional_id = self.request.query_params.get("profesional")
+        if not profesional_id:
+            return None
+
+        try:
+            profesional_id = int(profesional_id)
+        except (TypeError, ValueError):
+            return None
+
+        return User.objects.filter(
+            id=profesional_id,
+            is_active=True,
+            staff_profile__isnull=False,
+        ).first()
+
+    def _scope_citas(self, *, incluir_filtro_fecha=False):
+        qs = Cita.objects.select_related(
+            "paciente",
+            "servicio",
+            "profesional",
+        )
+
+        profesional = self._profesional_filtro()
+        if profesional:
+            qs = qs.filter(profesional=profesional)
+
+        if incluir_filtro_fecha:
+            fecha = self.request.query_params.get("fecha")
+            if fecha:
+                qs = qs.filter(fecha=fecha)
+
         return qs
 
+    def get_queryset(self):
+        return self._scope_citas(incluir_filtro_fecha=True).order_by(
+            "fecha",
+            "hora_inicio",
+            "id",
+        )
+
     def get_serializer_class(self):
-        if self.action == "create" and isinstance(self.request.data.get("paciente"), dict): return CitaCreateSerializer
+        if (
+            self.action == "create"
+            and isinstance(self.request.data.get("paciente"), dict)
+        ):
+            return CitaCreateSerializer
         return CitaSerializer
 
     def get_serializer_context(self):
-        ctx = super().get_serializer_context(); ctx["clinica"] = primera_clinica(); return ctx
+        ctx = super().get_serializer_context()
+        ctx["clinica"] = clinica_usuario(self.request.user) or primera_clinica()
+        return ctx
+
+    def _resolver_profesional_guardado(self, instance=None):
+        data = self.request.data
+        rol = self._rol()
+        profesional_payload = data.get("profesional")
+
+        if puede_ver_todas_agendas(rol):
+            if profesional_payload:
+                try:
+                    profesional_id = int(profesional_payload)
+                except (TypeError, ValueError):
+                    raise ValidationError({"profesional": "Profesional inválido."})
+
+                profesional = User.objects.filter(
+                    id=profesional_id,
+                    is_active=True,
+                    staff_profile__isnull=False,
+                ).first()
+
+                if not profesional:
+                    raise ValidationError({"profesional": "Profesional inválido."})
+
+                return profesional
+
+            if instance is not None:
+                return instance.profesional
+
+        return self.request.user
+
+    def _valores_financieros_servidor(self, servicio, instance=None):
+        """
+        Si el rol no puede ver dinero, tampoco puede modificarlo.
+
+        En creación se usa el precio del servicio.
+        En edición se conservan exactamente los valores actuales.
+        """
+        if puede_modificar_dinero(self.request.user):
+            return {}
+
+        if instance is not None:
+            return {
+                "precio": instance.precio,
+                "pagado": instance.pagado,
+                "metodo_pago": instance.metodo_pago,
+                "descuento_porcentaje": instance.descuento_porcentaje,
+                "anticipo": instance.anticipo,
+                "monto_final": instance.monto_final,
+            }
+
+        precio = Decimal(servicio.precio or 0) if servicio else Decimal("0")
+        return {
+            "precio": precio,
+            "pagado": False,
+            "metodo_pago": "",
+            "descuento_porcentaje": Decimal("0"),
+            "anticipo": Decimal("0"),
+            "monto_final": precio,
+        }
 
     def perform_create(self, serializer):
-        data = self.request.data; rol = rol_usuario(self.request.user); servicio_id = data.get("servicio") or data.get("servicio_id"); servicio = Servicio.objects.filter(id=servicio_id).first()
-        fecha = data.get("fecha"); hora_inicio = data.get("hora_inicio"); hora_termina = data.get("hora_termina")
-        if hora_inicio and len(hora_inicio) == 5: hora_inicio = f"{hora_inicio}:00"
-        if hora_termina and len(hora_termina) == 5: hora_termina = f"{hora_termina}:00"
-        if not hora_termina and servicio and fecha and hora_inicio: hora_termina = calcular_hora_termina(fecha, hora_inicio, servicio.duracion).strftime("%H:%M:%S")
-        profesional_payload = data.get("profesional"); profesional_id = int(profesional_payload) if puede_ver_todas_agendas(rol) and profesional_payload else self.request.user.id
-        profesional = User.objects.filter(id=profesional_id).first()
-        if not profesional: raise ValidationError({"profesional": "Profesional inválido."})
-        serializer.save(profesional=profesional)
+        data = self.request.data
+        servicio_id = data.get("servicio") or data.get("servicio_id")
+        servicio = Servicio.objects.filter(id=servicio_id).first()
+
+        if not servicio:
+            raise ValidationError({"servicio": "Servicio inválido."})
+
+        profesional = self._resolver_profesional_guardado()
+        kwargs = {
+            "profesional": profesional,
+            **self._valores_financieros_servidor(servicio),
+        }
+
+        serializer.save(**kwargs)
 
     def perform_update(self, serializer):
-        data = self.request.data; rol = rol_usuario(self.request.user); profesional_payload = data.get("profesional")
-        if puede_ver_todas_agendas(rol) and profesional_payload:
-            profesional = User.objects.filter(id=int(profesional_payload)).first()
-            if not profesional: raise ValidationError({"profesional": "Profesional inválido."})
-            serializer.save(profesional=profesional); return
-        serializer.save()
+        instance = serializer.instance
+        profesional = self._resolver_profesional_guardado(instance=instance)
+        kwargs = {
+            "profesional": profesional,
+            **self._valores_financieros_servidor(
+                getattr(instance, "servicio", None),
+                instance=instance,
+            ),
+        }
+        serializer.save(**kwargs)
 
     def update(self, request, *args, **kwargs):
-        instance = self.get_object(); serializer = self.get_serializer(instance, data=request.data, partial=True); serializer.is_valid(raise_exception=True)
-        try: self.perform_update(serializer)
-        except Exception as exc: return Response({"detail": str(exc)}, status=400)
+        instance = self.get_object()
+        data = request.data.copy()
+
+        if not puede_modificar_dinero(request.user):
+            for field in CAMPOS_DINERO_CITA:
+                data.pop(field, None)
+
+        serializer = self.get_serializer(
+            instance,
+            data=data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
         return Response(serializer.data)
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
-        try: self.perform_destroy(instance)
-        except Exception as exc: print("[CITAS] Error al eliminar cita:", repr(exc))
+        self.perform_destroy(instance)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _meta_payload(self, profesional=None):
+        clinica = clinica_usuario(self.request.user) or primera_clinica()
+        if not clinica:
+            return {
+                "meta_general": DEFAULT_DAILY_GOAL,
+                "meta_personal": None,
+                "meta_efectiva": DEFAULT_DAILY_GOAL,
+                "profesional": None,
+            }
+
+        general = MetaDiariaConsulta.objects.filter(
+            clinica=clinica,
+            profesional__isnull=True,
+        ).first()
+
+        if not general:
+            general = MetaDiariaConsulta.objects.create(
+                clinica=clinica,
+                profesional=None,
+                cantidad=DEFAULT_DAILY_GOAL,
+            )
+
+        personal = None
+        if profesional:
+            personal = MetaDiariaConsulta.objects.filter(
+                clinica=clinica,
+                profesional=profesional,
+            ).first()
+
+        return {
+            "meta_general": general.cantidad,
+            "meta_personal": personal.cantidad if personal else None,
+            "meta_efectiva": personal.cantidad if personal else general.cantidad,
+            "profesional": (
+                {
+                    "id": profesional.id,
+                    "nombre": nombre_usuario(profesional),
+                }
+                if profesional
+                else None
+            ),
+        }
+
+    @action(
+        detail=False,
+        methods=["get", "put"],
+        url_path="meta-diaria",
+        permission_classes=[IsAuthenticated],
+    )
+    def meta_diaria(self, request):
+        rol = rol_usuario(request.user)
+        clinica = clinica_usuario(request.user) or primera_clinica()
+
+        if not clinica:
+            return Response(
+                {"detail": "No existe clínica configurada."},
+                status=400,
+            )
+
+        profesional = self._profesional_filtro()
+
+        if request.method == "PUT":
+            if not es_admin(request.user):
+                return Response(
+                    {"detail": "Solo el administrador puede modificar metas."},
+                    status=403,
+                )
+
+            try:
+                cantidad = int(request.data.get("cantidad"))
+            except (TypeError, ValueError):
+                return Response(
+                    {"cantidad": "Escribe una cantidad válida."},
+                    status=400,
+                )
+
+            if cantidad < 1 or cantidad > 1000:
+                return Response(
+                    {"cantidad": "La meta debe estar entre 1 y 1000."},
+                    status=400,
+                )
+
+            profesional_id = request.data.get("profesional")
+            target = None
+
+            if profesional_id not in (None, "", 0, "0"):
+                try:
+                    target_id = int(profesional_id)
+                except (TypeError, ValueError):
+                    return Response(
+                        {"profesional": "Profesional inválido."},
+                        status=400,
+                    )
+
+                target = User.objects.filter(
+                    id=target_id,
+                    is_active=True,
+                    staff_profile__isnull=False,
+                ).first()
+
+                if not target:
+                    return Response(
+                        {"profesional": "Profesional inválido."},
+                        status=400,
+                    )
+
+            MetaDiariaConsulta.objects.update_or_create(
+                clinica=clinica,
+                profesional=target,
+                defaults={"cantidad": cantidad},
+            )
+
+            profesional = target
+
+        return Response(self._meta_payload(profesional))
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="panel",
+        permission_classes=[IsAuthenticated],
+    )
+    def panel(self, request):
+        referencia = parse_date(request.query_params.get("fecha") or "") or date.today()
+        rol = rol_usuario(request.user)
+        profesional = self._profesional_filtro()
+
+        citas_dia = Cita.objects.select_related(
+            "paciente",
+            "servicio",
+            "profesional",
+        ).filter(fecha=referencia)
+
+        scope_historico = Cita.objects.select_related(
+            "paciente",
+            "servicio",
+            "profesional",
+        )
+
+        if profesional:
+            citas_dia = citas_dia.filter(profesional=profesional)
+            scope_historico = scope_historico.filter(profesional=profesional)
+        elif not puede_ver_todas_agendas(rol):
+            citas_dia = citas_dia.filter(profesional=request.user)
+            scope_historico = scope_historico.filter(profesional=request.user)
+
+        total = citas_dia.count()
+        atendidas = citas_dia.filter(estado="completado").count()
+        canceladas = citas_dia.filter(estado="cancelado").count()
+        pendientes = citas_dia.exclude(
+            estado__in=["completado", "cancelado"]
+        ).count()
+
+        no_asistencias = (
+            scope_historico.filter(estado="cancelado")
+            .values(
+                "paciente_id",
+                "paciente__nombres",
+                "paciente__apellido_pat",
+                "paciente__apellido_mat",
+            )
+            .annotate(total=Count("id"))
+            .filter(total__gt=2)
+            .order_by("-total", "paciente__apellido_pat")[:20]
+        )
+
+        alertas_no_asistencia = [
+            {
+                "paciente_id": row["paciente_id"],
+                "paciente": (
+                    f"{row['paciente__nombres']} "
+                    f"{row['paciente__apellido_pat']} "
+                    f"{row['paciente__apellido_mat'] or ''}"
+                ).strip(),
+                "total_no_asistencias": row["total"],
+            }
+            for row in no_asistencias
+        ]
+
+        pendientes_cobro_qs = (
+            scope_historico.filter(
+                pagado=False,
+                fecha__lte=referencia,
+            )
+            .exclude(estado="cancelado")
+            .order_by("fecha", "hora_inicio")[:30]
+        )
+
+        alertas_cobro = [
+            {
+                "cita_id": cita.id,
+                "paciente_id": cita.paciente_id,
+                "paciente": nombre_paciente(cita.paciente),
+                "fecha": cita.fecha,
+                "hora": cita.hora_inicio,
+                "servicio": cita.servicio.nombre,
+                "profesional_id": cita.profesional_id,
+                "profesional": nombre_usuario(cita.profesional),
+            }
+            for cita in pendientes_cobro_qs
+        ]
+
+        clinica = clinica_usuario(request.user) or primera_clinica()
+        pacientes = Paciente.objects.filter(fecha_nac__isnull=False)
+
+        if clinica:
+            pacientes = pacientes.filter(clinica=clinica)
+
+        if profesional:
+            pacientes = pacientes.filter(
+                citas__profesional=profesional
+            ).distinct()
+        elif not puede_ver_todas_agendas(rol):
+            pacientes = pacientes.filter(
+                citas__profesional=request.user
+            ).distinct()
+
+        cumpleanos = []
+        for paciente in pacientes.only(
+            "id",
+            "nombres",
+            "apellido_pat",
+            "apellido_mat",
+            "fecha_nac",
+        ):
+            dias = dias_hasta_cumple(paciente.fecha_nac, referencia)
+            if dias is None or dias > 5:
+                continue
+
+            cumpleanos.append(
+                {
+                    "paciente_id": paciente.id,
+                    "paciente": nombre_paciente(paciente),
+                    "fecha_nac": paciente.fecha_nac,
+                    "dias_para_cumple": dias,
+                }
+            )
+
+        cumpleanos.sort(
+            key=lambda item: (
+                item["dias_para_cumple"],
+                item["paciente"],
+            )
+        )
+        cumpleanos = cumpleanos[:30]
+
+        finanzas = None
+        if puede_ver_dinero(request.user):
+            pagos = Pago.objects.select_related(
+                "cita",
+                "cita__profesional",
+            ).filter(fecha_pago=referencia)
+
+            if profesional:
+                pagos = pagos.filter(cita__profesional=profesional)
+            elif not puede_ver_todas_agendas(rol):
+                pagos = pagos.filter(cita__profesional=request.user)
+
+            cobrado = pagos.aggregate(total=Sum("anticipo")).get("total") or Decimal("0")
+            finanzas = {
+                "fecha_corte": referencia,
+                "ingreso_cobrado": cobrado,
+                "ingreso_esperado": cobrado,
+                "pagos_registrados": pagos.count(),
+                "criterio_fecha": "fecha_pago",
+            }
+
+        meta = self._meta_payload(profesional)
+        meta_efectiva = max(1, int(meta["meta_efectiva"] or DEFAULT_DAILY_GOAL))
+
+        return Response(
+            {
+                "fecha": referencia,
+                "rol": rol,
+                "puede_ver_dinero": puede_ver_dinero(request.user),
+                "permisos": permisos_usuario(request.user),
+                "profesional": (
+                    {
+                        "id": profesional.id,
+                        "nombre": nombre_usuario(profesional),
+                    }
+                    if profesional
+                    else None
+                ),
+                "metricas": {
+                    "agendadas": total,
+                    "atendidas": atendidas,
+                    "pendientes": pendientes,
+                    "canceladas": canceladas,
+                    "porcentaje_meta": min(
+                        100,
+                        round(total * 100 / meta_efectiva),
+                    ),
+                },
+                "meta_diaria": meta,
+                "finanzas": finanzas,
+                "alertas": {
+                    "no_asistencias": alertas_no_asistencia,
+                    "cumpleanos": cumpleanos,
+                    "cobros_pendientes": alertas_cobro,
+                },
+            }
+        )
 
 
 class BloqueoHorarioViewSet(viewsets.ModelViewSet):
-    queryset = BloqueoHorario.objects.select_related("profesional").all(); serializer_class = BloqueoHorarioSerializer; permission_classes = [IsAuthenticated]
+    queryset = BloqueoHorario.objects.select_related("profesional").all()
+    serializer_class = BloqueoHorarioSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        rol = rol_usuario(self.request.user); qs = super().get_queryset()
-        if es_profesional(rol): qs = qs.filter(profesional=self.request.user)
+        rol = rol_usuario(self.request.user)
+        qs = super().get_queryset()
+
+        if not puede_ver_todas_agendas(rol):
+            qs = qs.filter(profesional=self.request.user)
+        else:
+            profesional = self.request.query_params.get("profesional")
+            if profesional:
+                qs = qs.filter(profesional_id=profesional)
+
+        fecha = self.request.query_params.get("fecha")
+        if fecha:
+            qs = qs.filter(fecha=fecha)
+
         return qs
+
+    def perform_create(self, serializer):
+        rol = rol_usuario(self.request.user)
+        profesional = self.request.user
+
+        if puede_ver_todas_agendas(rol):
+            profesional_id = self.request.data.get("profesional")
+            if profesional_id:
+                profesional = User.objects.filter(
+                    id=profesional_id,
+                    is_active=True,
+                    staff_profile__isnull=False,
+                ).first()
+                if not profesional:
+                    raise ValidationError(
+                        {"profesional": "Profesional inválido."}
+                    )
+
+        serializer.save(profesional=profesional)
+
+    def perform_update(self, serializer):
+        rol = rol_usuario(self.request.user)
+
+        if puede_ver_todas_agendas(rol):
+            profesional_id = self.request.data.get("profesional")
+            if profesional_id:
+                profesional = User.objects.filter(
+                    id=profesional_id,
+                    is_active=True,
+                    staff_profile__isnull=False,
+                ).first()
+                if not profesional:
+                    raise ValidationError(
+                        {"profesional": "Profesional inválido."}
+                    )
+                serializer.save(profesional=profesional)
+                return
+
+            serializer.save()
+            return
+
+        serializer.save(profesional=self.request.user)
 
 
 @api_view(["GET"])
 @permission_classes([permissions.AllowAny])
 def public_agenda(request):
     fecha = request.query_params.get("fecha")
-    if not fecha: return Response({"detail": "fecha requerida"}, status=400)
+    if not fecha:
+        return Response({"detail": "fecha requerida"}, status=400)
+
     clinica = primera_clinica()
-    if not clinica: return Response({"detail": "No existe clínica configurada."}, status=400)
+    if not clinica:
+        return Response(
+            {"detail": "No existe clínica configurada."},
+            status=400,
+        )
+
     profesional = profesional_publico_default(clinica)
-    if not profesional: return Response({"detail": "No hay profesional configurado."}, status=400)
-    citas = Cita.objects.filter(fecha=fecha, profesional=profesional).exclude(estado="cancelado").only("hora_inicio", "hora_termina")
-    bloqueos = BloqueoHorario.objects.filter(fecha=fecha, profesional=profesional).only("hora_inicio", "hora_termina")
-    data = [{"hora_inicio": c.hora_inicio.strftime("%H:%M:%S"), "hora_termina": c.hora_termina.strftime("%H:%M:%S"), "kind": "cita"} for c in citas]
-    data += [{"hora_inicio": b.hora_inicio.strftime("%H:%M:%S"), "hora_termina": b.hora_termina.strftime("%H:%M:%S"), "kind": "bloqueo"} for b in bloqueos]
+    if not profesional:
+        return Response(
+            {"detail": "No hay profesional configurado."},
+            status=400,
+        )
+
+    citas = (
+        Cita.objects.filter(
+            fecha=fecha,
+            profesional=profesional,
+        )
+        .exclude(estado="cancelado")
+        .only("hora_inicio", "hora_termina")
+    )
+
+    bloqueos = BloqueoHorario.objects.filter(
+        fecha=fecha,
+        profesional=profesional,
+    ).only("hora_inicio", "hora_termina")
+
+    data = [
+        {
+            "hora_inicio": cita.hora_inicio.strftime("%H:%M:%S"),
+            "hora_termina": cita.hora_termina.strftime("%H:%M:%S"),
+            "kind": "cita",
+        }
+        for cita in citas
+    ]
+
+    data += [
+        {
+            "hora_inicio": bloqueo.hora_inicio.strftime("%H:%M:%S"),
+            "hora_termina": bloqueo.hora_termina.strftime("%H:%M:%S"),
+            "kind": "bloqueo",
+        }
+        for bloqueo in bloqueos
+    ]
+
     return Response(data)
 
 
@@ -86,19 +688,116 @@ def public_agenda(request):
 @permission_classes([permissions.AllowAny])
 def public_create_cita(request):
     clinica = primera_clinica()
-    if not clinica: return Response({"detail": "No existe clínica configurada."}, status=400)
-    nombre = (request.data.get("nombre") or "").strip(); telefono = (request.data.get("telefono") or "").strip(); servicio_id = request.data.get("servicio_id"); fecha = request.data.get("fecha"); hora_inicio = request.data.get("hora_inicio")
-    if not (nombre and telefono and servicio_id and fecha and hora_inicio): return Response({"detail": "Faltan campos requeridos."}, status=400)
-    servicio = Servicio.objects.filter(id=servicio_id, activo=True).first()
-    if not servicio: return Response({"detail": "Servicio inválido."}, status=400)
-    hora_inicio_full = f"{hora_inicio}:00" if len(hora_inicio) == 5 else hora_inicio
-    paciente = buscar_paciente_publico_similar(clinica=clinica, nombre=nombre, telefono=telefono)
-    if not paciente: paciente = Paciente.objects.create(clinica=clinica, nombres=nombre, apellido_pat="", apellido_mat="", fecha_nac=None, genero="", telefono=telefono, correo="", molestia="", notas="")
+    if not clinica:
+        return Response(
+            {"detail": "No existe clínica configurada."},
+            status=400,
+        )
+
+    nombre = (request.data.get("nombre") or "").strip()
+    telefono = (request.data.get("telefono") or "").strip()
+    servicio_id = request.data.get("servicio_id")
+    fecha = request.data.get("fecha")
+    hora_inicio = request.data.get("hora_inicio")
+
+    if not (nombre and telefono and servicio_id and fecha and hora_inicio):
+        return Response(
+            {"detail": "Faltan campos requeridos."},
+            status=400,
+        )
+
+    servicio = Servicio.objects.filter(
+        id=servicio_id,
+        activo=True,
+    ).first()
+
+    if not servicio:
+        return Response({"detail": "Servicio inválido."}, status=400)
+
+    hora_inicio_full = (
+        f"{hora_inicio}:00"
+        if len(hora_inicio) == 5
+        else hora_inicio
+    )
+
+    paciente = buscar_paciente_publico_similar(
+        clinica=clinica,
+        nombre=nombre,
+        telefono=telefono,
+    )
+
+    if not paciente:
+        paciente = Paciente.objects.create(
+            clinica=clinica,
+            nombres=nombre,
+            apellido_pat="",
+            apellido_mat="",
+            fecha_nac=None,
+            genero="",
+            telefono=telefono,
+            correo="",
+            molestia="",
+            notas="",
+        )
+
     profesional = profesional_publico_default(clinica)
-    if not profesional: return Response({"detail": "No hay profesional configurado."}, status=400)
-    hora_termina = calcular_hora_termina(fecha, hora_inicio_full, servicio.duracion).strftime("%H:%M:%S"); hi = datetime.strptime(hora_inicio_full, "%H:%M:%S").time(); ht = datetime.strptime(hora_termina, "%H:%M:%S").time()
-    if validar_conflicto_cita(profesional_id=profesional.id, fecha=fecha, hora_inicio=hi, hora_termina=ht): return Response({"detail": "Horario ya ocupado."}, status=409)
-    for bloqueo in BloqueoHorario.objects.filter(fecha=fecha, profesional=profesional).only("hora_inicio", "hora_termina"):
-        if se_superponen(hi, ht, bloqueo.hora_inicio, bloqueo.hora_termina): return Response({"detail": "Horario no disponible."}, status=409)
-    cita = Cita.objects.create(paciente=paciente, servicio=servicio, profesional=profesional, fecha=fecha, hora_inicio=hi, hora_termina=ht, precio=servicio.precio, estado="reservado", pagado=False)
-    return Response(CitaSerializer(cita).data, status=201)
+    if not profesional:
+        return Response(
+            {"detail": "No hay profesional configurado."},
+            status=400,
+        )
+
+    hora_termina = calcular_hora_termina(
+        fecha,
+        hora_inicio_full,
+        servicio.duracion,
+    ).strftime("%H:%M:%S")
+
+    hi = datetime.strptime(hora_inicio_full, "%H:%M:%S").time()
+    ht = datetime.strptime(hora_termina, "%H:%M:%S").time()
+
+    if validar_conflicto_cita(
+        profesional_id=profesional.id,
+        fecha=fecha,
+        hora_inicio=hi,
+        hora_termina=ht,
+    ):
+        return Response(
+            {"detail": "Horario ya ocupado."},
+            status=409,
+        )
+
+    for bloqueo in BloqueoHorario.objects.filter(
+        fecha=fecha,
+        profesional=profesional,
+    ).only("hora_inicio", "hora_termina"):
+        if se_superponen(
+            hi,
+            ht,
+            bloqueo.hora_inicio,
+            bloqueo.hora_termina,
+        ):
+            return Response(
+                {"detail": "Horario no disponible."},
+                status=409,
+            )
+
+    cita = Cita.objects.create(
+        paciente=paciente,
+        servicio=servicio,
+        profesional=profesional,
+        fecha=fecha,
+        hora_inicio=hi,
+        hora_termina=ht,
+        precio=servicio.precio,
+        monto_final=servicio.precio,
+        estado="reservado",
+        pagado=False,
+    )
+
+    return Response(
+        CitaSerializer(cita).data,
+        status=201,
+    )
+
+
