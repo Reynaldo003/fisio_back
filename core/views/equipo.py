@@ -9,7 +9,15 @@ from core.models import RolPersonalizado
 from core.permissions import IsAdminUserStrict
 from core.serializers.equipo import RolPersonalizadoSerializer, StaffUserSerializer, UserSerializer
 from core.utilidades import interfaces_usuario, password_fuerte, permisos_usuario, rol_usuario
+from django.db.models import Q
 
+ROLES_CON_AGENDA = [
+    "admin",
+    "fisioterapeuta",
+    "terapeuta",
+    "nutriologo",
+    "dentista",
+]
 
 @api_view(["GET"])
 @permission_classes([permissions.AllowAny])
@@ -39,17 +47,37 @@ class RolPersonalizadoViewSet(viewsets.ModelViewSet):
     serializer_class = RolPersonalizadoSerializer
     permission_classes = [IsAdminUserStrict]
 
-
 class ProfesionalViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return User.objects.filter(
-            is_active=True,
-            staff_profile__isnull=False,
-            staff_profile__rol__in=["fisioterapeuta", "terapeuta", "practicante", "nutriologo", "dentista"],
-        ).select_related("staff_profile", "staff_profile__rol_personalizado").order_by("first_name", "last_name", "username")
+        return (
+            User.objects
+            .filter(
+                is_active=True,
+                staff_profile__isnull=False,
+            )
+            .filter(
+                Q(staff_profile__rol__in=ROLES_CON_AGENDA)
+                |
+                Q(
+                    staff_profile__rol="personalizado",
+                    staff_profile__rol_personalizado__activo=True,
+                    staff_profile__rol_personalizado__puede_ver_agenda=True,
+                )
+            )
+            .select_related(
+                "staff_profile",
+                "staff_profile__rol_personalizado",
+            )
+            .distinct()
+            .order_by(
+                "first_name",
+                "last_name",
+                "username",
+            )
+        )
 
 
 @api_view(["GET"])
