@@ -9,6 +9,8 @@ from .models import BloqueoHorario, Cita, Clinica, Paciente
 
 PUBLIC_DEFAULT_PRO_NAME = "l.f.t edgar mauricio medina cruz"
 INTERFACES_SISTEMA = ["agenda", "pacientes", "ventas", "servicios", "comentarios", "equipo", "insumos", "perfil"]
+ROLES_DINERO = {"admin", "fisioterapeuta", "recepcion"}
+ROLES_TODAS_AGENDAS = {"admin", "fisioterapeuta", "recepcion"}
 
 PERMISOS_BASE = {
     "admin": {
@@ -32,6 +34,22 @@ PERMISOS_BASE = {
         "puede_ver_pacientes": True,
         "puede_ver_contacto_paciente": True,
         "puede_ver_montos": True,
+        "puede_modificar_montos": True,
+        "puede_ver_finanzas": True,
+        "puede_ver_servicios": False,
+        "puede_ver_comentarios": False,
+        "puede_ver_equipo": False,
+        "puede_editar_equipo": False,
+        "puede_ver_insumos": False,
+        "puede_editar_insumos": False,
+        "puede_ver_perfil": True,
+        "interfaces": ["agenda", "pacientes", "ventas", "perfil"],
+    },
+    "terapeuta": {
+        "puede_ver_agenda": True,
+        "puede_ver_pacientes": True,
+        "puede_ver_contacto_paciente": True,
+        "puede_ver_montos": False,
         "puede_modificar_montos": False,
         "puede_ver_finanzas": False,
         "puede_ver_servicios": False,
@@ -43,11 +61,27 @@ PERMISOS_BASE = {
         "puede_ver_perfil": True,
         "interfaces": ["agenda", "pacientes", "perfil"],
     },
-    "terapeuta": {
+    "recepcion": {
         "puede_ver_agenda": True,
-        "puede_ver_pacientes": True,
+        "puede_ver_pacientes": False,
         "puede_ver_contacto_paciente": True,
         "puede_ver_montos": True,
+        "puede_modificar_montos": True,
+        "puede_ver_finanzas": True,
+        "puede_ver_servicios": False,
+        "puede_ver_comentarios": False,
+        "puede_ver_equipo": False,
+        "puede_editar_equipo": False,
+        "puede_ver_insumos": False,
+        "puede_editar_insumos": False,
+        "puede_ver_perfil": True,
+        "interfaces": ["agenda", "ventas", "perfil"],
+    },
+    "practicante": {
+        "puede_ver_agenda": True,
+        "puede_ver_pacientes": True,
+        "puede_ver_contacto_paciente": False,
+        "puede_ver_montos": False,
         "puede_modificar_montos": False,
         "puede_ver_finanzas": False,
         "puede_ver_servicios": False,
@@ -79,38 +113,6 @@ PERMISOS_BASE = {
         "puede_ver_agenda": True,
         "puede_ver_pacientes": True,
         "puede_ver_contacto_paciente": True,
-        "puede_ver_montos": False,
-        "puede_modificar_montos": False,
-        "puede_ver_finanzas": False,
-        "puede_ver_servicios": False,
-        "puede_ver_comentarios": False,
-        "puede_ver_equipo": False,
-        "puede_editar_equipo": False,
-        "puede_ver_insumos": False,
-        "puede_editar_insumos": False,
-        "puede_ver_perfil": True,
-        "interfaces": ["agenda", "pacientes", "perfil"],
-    },
-    "recepcion": {
-        "puede_ver_agenda": True,
-        "puede_ver_pacientes": False,
-        "puede_ver_contacto_paciente": True,
-        "puede_ver_montos": False,
-        "puede_modificar_montos": False,
-        "puede_ver_finanzas": False,
-        "puede_ver_servicios": False,
-        "puede_ver_comentarios": False,
-        "puede_ver_equipo": False,
-        "puede_editar_equipo": False,
-        "puede_ver_insumos": False,
-        "puede_editar_insumos": False,
-        "puede_ver_perfil": True,
-        "interfaces": ["agenda", "perfil"],
-    },
-    "practicante": {
-        "puede_ver_agenda": True,
-        "puede_ver_pacientes": True,
-        "puede_ver_contacto_paciente": False,
         "puede_ver_montos": False,
         "puede_modificar_montos": False,
         "puede_ver_finanzas": False,
@@ -187,15 +189,20 @@ def rol_usuario(user):
         return perfil.rol
     return "colaborador"
 
-
 def permisos_usuario(user):
     if not user or not user.is_authenticated:
         return {**PERMISOS_BASE["colaborador"], "interfaces": []}
-    if user.is_superuser:
-        return dict(PERMISOS_BASE["admin"])
+
     staff = getattr(user, "staff_profile", None)
-    if staff and staff.rol == "personalizado" and staff.rol_personalizado_id and staff.rol_personalizado.activo:
+
+    if user.is_superuser:
+        rol_actual = "admin"
+        permisos = dict(PERMISOS_BASE["admin"])
+        permisos["interfaces"] = list(permisos.get("interfaces") or [])
+
+    elif staff and staff.rol == "personalizado" and staff.rol_personalizado_id and staff.rol_personalizado.activo:
         rol = staff.rol_personalizado
+        rol_actual = rol.slug
         permisos = {
             "puede_ver_agenda": rol.puede_ver_agenda,
             "puede_ver_pacientes": rol.puede_ver_pacientes,
@@ -212,14 +219,34 @@ def permisos_usuario(user):
             "puede_ver_perfil": rol.puede_ver_perfil,
             "interfaces": list(rol.interfaces or []),
         }
-    else:
-        base_rol = staff.rol if staff and staff.rol else rol_usuario(user)
-        permisos = dict(PERMISOS_BASE.get(base_rol, PERMISOS_BASE["colaborador"]))
-        permisos["interfaces"] = list(permisos.get("interfaces") or [])
-    if staff and staff.usar_interfaces_override:
-        permisos["interfaces"] = [item for item in (staff.interfaces_override or []) if item in INTERFACES_SISTEMA]
-    return permisos
 
+    else:
+        rol_actual = staff.rol if staff and staff.rol else rol_usuario(user)
+        permisos = dict(PERMISOS_BASE.get(rol_actual, PERMISOS_BASE["colaborador"]))
+        permisos["interfaces"] = list(permisos.get("interfaces") or [])
+
+    if staff and staff.usar_interfaces_override:
+        permisos["interfaces"] = [
+            item for item in (staff.interfaces_override or [])
+            if item in INTERFACES_SISTEMA
+        ]
+
+    # Seguridad dura de dinero.
+    # Ningún rol personalizado puede brincarse esta regla.
+    puede_dinero = rol_actual in ROLES_DINERO
+
+    permisos["puede_ver_montos"] = puede_dinero
+    permisos["puede_modificar_montos"] = puede_dinero
+    permisos["puede_ver_finanzas"] = puede_dinero
+    permisos["puede_ver_todas_agendas"] = rol_actual in ROLES_TODAS_AGENDAS
+
+    if not puede_dinero:
+        permisos["interfaces"] = [
+            interfaz for interfaz in permisos["interfaces"]
+            if interfaz != "ventas"
+        ]
+
+    return permisos
 
 def interfaces_usuario(user):
     return permisos_usuario(user).get("interfaces", [])
@@ -230,36 +257,37 @@ def es_admin(rol_o_user):
         return permisos_usuario(rol_o_user).get("puede_editar_equipo", False) and rol_usuario(rol_o_user) == "admin"
     return rol_o_user == "admin"
 
-
-def puede_ver_todas_agendas(rol_o_user):
-    if hasattr(rol_o_user, "is_authenticated"):
-        rol_o_user = rol_usuario(rol_o_user)
-    return rol_o_user in ("admin", "recepcion")
-
-
 def es_profesional(rol_o_user):
     if hasattr(rol_o_user, "is_authenticated"):
         rol_o_user = rol_usuario(rol_o_user)
     return rol_o_user in ("fisioterapeuta", "terapeuta", "practicante", "nutriologo", "dentista")
 
+def puede_ver_todas_agendas(rol_o_user):
+    if hasattr(rol_o_user, "is_authenticated"):
+        rol_o_user = rol_usuario(rol_o_user)
+    return rol_o_user in ROLES_TODAS_AGENDAS
+
 
 def puede_ver_dinero(rol_o_user):
     if hasattr(rol_o_user, "is_authenticated"):
-        return bool(permisos_usuario(rol_o_user).get("puede_ver_montos"))
-    return rol_o_user in ("admin", "fisioterapeuta", "terapeuta")
+        rol_o_user = rol_usuario(rol_o_user)
+    return rol_o_user in ROLES_DINERO
 
 
-def puede_modificar_dinero(user):
-    return bool(permisos_usuario(user).get("puede_modificar_montos"))
+def puede_modificar_dinero(rol_o_user):
+    if hasattr(rol_o_user, "is_authenticated"):
+        rol_o_user = rol_usuario(rol_o_user)
+    return rol_o_user in ROLES_DINERO
 
 
-def puede_ver_finanzas(user):
-    return bool(permisos_usuario(user).get("puede_ver_finanzas"))
+def puede_ver_finanzas(rol_o_user):
+    if hasattr(rol_o_user, "is_authenticated"):
+        rol_o_user = rol_usuario(rol_o_user)
+    return rol_o_user in ROLES_DINERO
 
 
 def puede_ver_contacto_paciente(user):
     return bool(permisos_usuario(user).get("puede_ver_contacto_paciente"))
-
 
 def puede_gestionar_equipo(user):
     return bool(permisos_usuario(user).get("puede_editar_equipo"))

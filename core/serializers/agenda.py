@@ -5,15 +5,14 @@ from core.utilidades import puede_ver_dinero
 
 from .pacientes import PacienteInlineSerializer
 
-
 CAMPOS_MONETARIOS = {
     "precio",
+    "pagado",
     "metodo_pago",
     "descuento_porcentaje",
     "anticipo",
     "monto_final",
 }
-
 
 def ocultar_dinero_segun_rol(serializer, data):
     request = serializer.context.get("request")

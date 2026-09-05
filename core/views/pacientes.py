@@ -11,8 +11,8 @@ from rest_framework.response import Response
 from core.models import Cita, DocumentoPaciente, Paciente, RegistroClinico
 from core.serializers.agenda import CitaSerializer
 from core.serializers.pacientes import DocumentoPacienteSerializer, PacienteListadoSerializer, PacienteSerializer, RegistroClinicoSerializer
-from core.utilidades import es_profesional, primera_clinica, rol_usuario
-
+from core.utilidades import es_profesional, primera_clinica, puede_ver_contacto_paciente, rol_usuario
+from django.utils.dateparse import parse_date
 
 class PaginacionPacientes(PageNumberPagination):
     page_size = 200
@@ -43,30 +43,229 @@ class PacienteViewSet(viewsets.ModelViewSet):
         return qs
 
     def get_queryset(self):
-        qs = self._base_queryset(); search = (self.request.query_params.get("search") or "").strip(); profesional = self.request.query_params.get("profesional"); servicio = self.request.query_params.get("servicio")
-        estado_reserva = (self.request.query_params.get("estado_reserva") or "").strip().lower(); estado_tratamiento = (self.request.query_params.get("estado_tratamiento") or "").strip().lower(); clinica_nombre = (self.request.query_params.get("clinica_nombre") or "").strip()
-        desde = self.request.query_params.get("registro_desde"); hasta = self.request.query_params.get("registro_hasta")
-        if search: qs = qs.filter(Q(nombres__icontains=search) | Q(apellido_pat__icontains=search) | Q(apellido_mat__icontains=search) | Q(correo__icontains=search) | Q(telefono__icontains=search))
-        if clinica_nombre: qs = qs.filter(clinica__nombre__iexact=clinica_nombre)
-        if estado_tratamiento in {"en_tratamiento", "alta"}: qs = qs.filter(estado_tratamiento=estado_tratamiento)
-        if desde: qs = qs.filter(registro__gte=desde)
-        if hasta: qs = qs.filter(registro__lte=hasta)
+        qs = self._base_queryset()
+
+        search = (self.request.query_params.get("search") or "").strip()
+        profesional = self.request.query_params.get("profesional")
+        servicio = self.request.query_params.get("servicio")
+        estado_reserva = (self.request.query_params.get("estado_reserva") or "").strip().lower()
+        estado_tratamiento = (self.request.query_params.get("estado_tratamiento") or "").strip().lower()
+        clinica_nombre = (self.request.query_params.get("clinica_nombre") or "").strip()
+        desde = self.request.query_params.get("registro_desde")
+        hasta = self.request.query_params.get("registro_hasta")
+
+        if search:
+            filtro_busqueda = (
+                Q(nombres__icontains=search) |
+                Q(apellido_pat__icontains=search) |
+                Q(apellido_mat__icontains=search)
+            )
+
+            if puede_ver_contacto_paciente(self.request.user):
+                filtro_busqueda |= (
+                    Q(correo__icontains=search) |
+                    Q(telefono__icontains=search)
+                )
+
+            qs = qs.filter(filtro_busqueda)
+
+        if clinica_nombre:
+            qs = qs.filter(clinica__nombre__iexact=clinica_nombre)
+
+        if estado_tratamiento in {"en_tratamiento", "alta"}:
+            qs = qs.filter(estado_tratamiento=estado_tratamiento)
+
+        if desde:
+            qs = qs.filter(registro__gte=desde)
+
+        if hasta:
+            qs = qs.filter(registro__lte=hasta)
 
         citas_filtro = Cita.objects.filter(paciente_id=OuterRef("pk"))
+
         if profesional:
-            try: qs = qs.annotate(_filtro_profesional=Exists(citas_filtro.filter(profesional_id=int(profesional)))).filter(_filtro_profesional=True)
-            except (TypeError, ValueError): pass
+            try:
+                qs = qs.annotate(
+                    _filtro_profesional=Exists(
+                        citas_filtro.filter(profesional_id=int(profesional))
+                    )
+                ).filter(_filtro_profesional=True)
+            except (TypeError, ValueError):
+                pass
+
         if servicio:
-            try: filtro_servicio = citas_filtro.filter(servicio_id=int(servicio))
-            except (TypeError, ValueError): filtro_servicio = citas_filtro.filter(servicio__nombre__iexact=servicio)
-            qs = qs.annotate(_filtro_servicio=Exists(filtro_servicio)).filter(_filtro_servicio=True)
-        if estado_reserva in {"con", "con reservas"}: qs = qs.annotate(_tiene_citas=Exists(citas_filtro)).filter(_tiene_citas=True)
-        if estado_reserva in {"sin", "sin reservas"}: qs = qs.annotate(_tiene_citas=Exists(citas_filtro)).filter(_tiene_citas=False)
+            try:
+                filtro_servicio = citas_filtro.filter(servicio_id=int(servicio))
+            except (TypeError, ValueError):
+                filtro_servicio = citas_filtro.filter(servicio__nombre__iexact=servicio)
 
-        ultima = Cita.objects.filter(paciente_id=OuterRef("pk")).order_by("-fecha", "-hora_inicio", "-id")
-        conteo = Cita.objects.filter(paciente_id=OuterRef("pk")).values("paciente_id").annotate(total=Count("id")).values("total")[:1]
-        return qs.annotate(ultimo_servicio=Subquery(ultima.values("servicio__nombre")[:1]), ultima_cita_fecha=Subquery(ultima.values("fecha")[:1]), total_citas=Coalesce(Subquery(conteo, output_field=IntegerField()), Value(0))).order_by("apellido_pat", "apellido_mat", "nombres", "id")
+            qs = qs.annotate(
+                _filtro_servicio=Exists(filtro_servicio)
+            ).filter(_filtro_servicio=True)
 
+        if estado_reserva in {"con", "con reservas"}:
+            qs = qs.annotate(
+                _tiene_citas=Exists(citas_filtro)
+            ).filter(_tiene_citas=True)
+
+        if estado_reserva in {"sin", "sin reservas"}:
+            qs = qs.annotate(
+                _tiene_citas=Exists(citas_filtro)
+            ).filter(_tiene_citas=False)
+
+        ultima = Cita.objects.filter(
+            paciente_id=OuterRef("pk")
+        ).order_by("-fecha", "-hora_inicio", "-id")
+
+        conteo = (
+            Cita.objects
+            .filter(paciente_id=OuterRef("pk"))
+            .values("paciente_id")
+            .annotate(total=Count("id"))
+            .values("total")[:1]
+        )
+
+        return qs.annotate(
+            ultimo_servicio=Subquery(
+                ultima.values("servicio__nombre")[:1]
+            ),
+            ultima_cita_fecha=Subquery(
+                ultima.values("fecha")[:1]
+            ),
+            total_citas=Coalesce(
+                Subquery(conteo, output_field=IntegerField()),
+                Value(0),
+            ),
+        ).order_by(
+            "apellido_pat",
+            "apellido_mat",
+            "nombres",
+            "id",
+        )
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        paciente = self.get_object()
+        data = request.data.copy()
+
+        # Un usuario sin permiso de contacto no puede sobrescribir,
+        # borrar ni modificar teléfono/correo.
+        if not puede_ver_contacto_paciente(request.user):
+            data.pop("telefono", None)
+            data.pop("correo", None)
+
+        estado_anterior = paciente.estado_tratamiento
+        estado_nuevo = data.get(
+            "estado_tratamiento",
+            estado_anterior,
+        )
+
+        pasa_a_alta = (
+            estado_anterior != "alta" and
+            estado_nuevo == "alta"
+        )
+
+        fecha_alta = paciente.fecha_alta
+
+        if estado_nuevo == "alta":
+            fecha_alta_raw = data.get("fecha_alta")
+
+            if fecha_alta_raw:
+                fecha_alta = parse_date(
+                    str(fecha_alta_raw)
+                )
+
+                if not fecha_alta:
+                    return Response(
+                        {
+                            "fecha_alta": (
+                                "La fecha de alta no es válida."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                fecha_alta = date.today()
+                data["fecha_alta"] = (
+                    fecha_alta.isoformat()
+                )
+        else:
+            fecha_alta = None
+            data["fecha_alta"] = None
+
+        citas_posteriores = Cita.objects.none()
+        total_citas_posteriores = 0
+
+        if pasa_a_alta and fecha_alta:
+            citas_posteriores = (
+                paciente.citas
+                .filter(fecha__gt=fecha_alta)
+                .exclude(estado="cancelado")
+                .order_by("fecha", "hora_inicio")
+            )
+
+            total_citas_posteriores = (
+                citas_posteriores.count()
+            )
+
+        decision_raw = request.query_params.get(
+            "eliminar_citas_posteriores"
+        )
+
+        decision_eliminar = None
+
+        if decision_raw is not None:
+            decision_eliminar = (
+                str(decision_raw).strip().lower()
+                in {"1", "true", "si", "sí", "yes"}
+            )
+
+        if (
+            pasa_a_alta and
+            total_citas_posteriores > 0 and
+            decision_eliminar is None
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "El paciente tiene citas posteriores "
+                        "a la fecha de alta."
+                    ),
+                    "requiere_confirmar_citas_posteriores": True,
+                    "total_citas_posteriores": total_citas_posteriores,
+                    "fecha_alta": fecha_alta.isoformat(),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        serializer = self.get_serializer(
+            paciente,
+            data=data,
+            partial=partial,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            serializer.save()
+
+            citas_eliminadas = 0
+
+            if (
+                pasa_a_alta and
+                total_citas_posteriores > 0 and
+                decision_eliminar is True
+            ):
+                citas_eliminadas = (
+                    total_citas_posteriores
+                )
+                citas_posteriores.delete()
+
+        response_data = dict(serializer.data)
+        response_data[
+            "citas_posteriores_eliminadas"
+        ] = citas_eliminadas
+
+        return Response(response_data)
     def get_serializer_class(self): return PacienteListadoSerializer if self.action == "list" else PacienteSerializer
 
     def perform_create(self, serializer):

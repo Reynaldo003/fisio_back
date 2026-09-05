@@ -17,9 +17,11 @@ class PacienteInlineSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get("request")
+
         if request and not puede_ver_contacto_paciente(request.user):
-            data["telefono"] = ""
-            data["correo"] = ""
+            data.pop("telefono", None)
+            data.pop("correo", None)
+
         return data
 
 
@@ -47,9 +49,11 @@ class PacienteListadoSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get("request")
+
         if request and not puede_ver_contacto_paciente(request.user):
-            data["telefono"] = ""
-            data["correo"] = ""
+            data.pop("telefono", None)
+            data.pop("correo", None)
+
         return data
 
 
