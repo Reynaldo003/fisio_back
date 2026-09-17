@@ -15,6 +15,7 @@ ROLES_CON_AGENDA = [
     "admin",
     "fisioterapeuta",
     "terapeuta",
+    "practicante",
     "nutriologo",
     "dentista",
 ]
@@ -59,7 +60,9 @@ class ProfesionalViewSet(viewsets.ReadOnlyModelViewSet):
                 staff_profile__isnull=False,
             )
             .filter(
-                Q(staff_profile__rol__in=ROLES_CON_AGENDA)
+                Q(
+                    staff_profile__rol__in=ROLES_CON_AGENDA
+                )
                 |
                 Q(
                     staff_profile__rol="personalizado",
@@ -78,7 +81,6 @@ class ProfesionalViewSet(viewsets.ReadOnlyModelViewSet):
                 "username",
             )
         )
-
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
