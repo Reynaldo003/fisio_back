@@ -54,8 +54,14 @@ class CitaSerializer(serializers.ModelSerializer):
 
 class CitaCreateSerializer(serializers.ModelSerializer):
     paciente = PacienteInlineSerializer()
-    paciente_id = serializers.IntegerField(required=False, write_only=True)
-    paciente_uuid = serializers.UUIDField(required=False, write_only=True)
+    paciente_id = serializers.IntegerField(
+        required=False,
+        write_only=True,
+    )
+    paciente_uuid = serializers.UUIDField(
+        required=False,
+        write_only=True,
+    )
 
     class Meta:
         model = Cita
@@ -78,43 +84,114 @@ class CitaCreateSerializer(serializers.ModelSerializer):
             "monto_final",
         ]
 
-    def _resolver_paciente_existente(self, clinica, paciente_data):
-        paciente_id = self.initial_data.get("paciente_id") or paciente_data.get("id")
-        paciente_uuid = self.initial_data.get("paciente_uuid") or paciente_data.get("uuid")
+    def _resolver_paciente_existente(
+        self,
+        clinica,
+        paciente_data,
+    ):
+        paciente_id = (
+            self.initial_data.get("paciente_id")
+            or paciente_data.get("id")
+        )
+
+        paciente_uuid = (
+            self.initial_data.get("paciente_uuid")
+            or paciente_data.get("uuid")
+        )
 
         if paciente_id:
-            return Paciente.objects.filter(clinica=clinica, id=paciente_id).first()
+            return Paciente.objects.filter(
+                clinica=clinica,
+                id=paciente_id,
+            ).first()
 
         if paciente_uuid:
-            return Paciente.objects.filter(clinica=clinica, uuid=paciente_uuid).first()
+            return Paciente.objects.filter(
+                clinica=clinica,
+                uuid=paciente_uuid,
+            ).first()
 
         return None
 
     def create(self, validated_data):
-        paciente_data = validated_data.pop("paciente", {})
+        paciente_data = validated_data.pop(
+            "paciente",
+            {},
+        )
+
         clinica = self.context["clinica"]
-        paciente = self._resolver_paciente_existente(clinica, paciente_data)
+
+        paciente = self._resolver_paciente_existente(
+            clinica,
+            paciente_data,
+        )
 
         if not paciente:
             paciente = Paciente.objects.create(
                 clinica=clinica,
-                nombres=paciente_data.get("nombres", "").strip(),
-                apellido_pat=paciente_data.get("apellido_pat", "").strip(),
-                apellido_mat=paciente_data.get("apellido_mat", "").strip(),
-                fecha_nac=paciente_data.get("fecha_nac"),
-                genero=paciente_data.get("genero", "").strip(),
-                telefono=paciente_data.get("telefono", "").strip(),
-                correo=paciente_data.get("correo", "").strip(),
-                molestia=paciente_data.get("molestia", "").strip(),
-                notas=paciente_data.get("notas", "").strip(),
+                nombres=paciente_data.get(
+                    "nombres",
+                    "",
+                ).strip(),
+                apellido_pat=paciente_data.get(
+                    "apellido_pat",
+                    "",
+                ).strip(),
+                apellido_mat=paciente_data.get(
+                    "apellido_mat",
+                    "",
+                ).strip(),
+                fecha_nac=paciente_data.get(
+                    "fecha_nac"
+                ),
+                genero=paciente_data.get(
+                    "genero",
+                    "",
+                ).strip(),
+                telefono=paciente_data.get(
+                    "telefono",
+                    "",
+                ).strip(),
+                correo=paciente_data.get(
+                    "correo",
+                    "",
+                ).strip(),
+                molestia=paciente_data.get(
+                    "molestia",
+                    "",
+                ).strip(),
+                notas=paciente_data.get(
+                    "notas",
+                    "",
+                ).strip(),
             )
 
-        return Cita.objects.create(paciente=paciente, **validated_data)
+        return Cita.objects.create(
+            paciente=paciente,
+            **validated_data,
+        )
 
     def to_representation(self, instance):
-        data = super().to_representation(instance)
-        return ocultar_dinero_segun_rol(self, data)
+        """
+        La creación necesita un serializer especial porque
+        permite recibir el paciente como objeto.
 
+        Pero una vez creada la cita, devolvemos exactamente
+        la misma estructura utilizada por GET /api/citas/.
+
+        De esta manera el frontend recibe:
+        - id
+        - paciente como ID
+        - paciente_nombre
+        - servicio_nombre
+        - profesional_nombre
+        - resto de campos normales de la cita
+        """
+
+        return CitaSerializer(
+            instance,
+            context=self.context,
+        ).data
 
 class BloqueoHorarioSerializer(serializers.ModelSerializer):
     profesional_nombre = serializers.SerializerMethodField(read_only=True)
