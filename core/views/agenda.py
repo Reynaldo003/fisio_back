@@ -107,7 +107,6 @@ class CitaViewSet(viewsets.ModelViewSet):
 
         return User.objects.filter(
             id=profesional_id,
-            is_active=True,
             staff_profile__isnull=False,
         ).first()
 
@@ -161,6 +160,9 @@ class CitaViewSet(viewsets.ModelViewSet):
                 except (TypeError, ValueError):
                     raise ValidationError({"profesional": "Profesional inválido."})
 
+                if instance is not None and profesional_id == instance.profesional_id:
+                    return instance.profesional
+
                 profesional = User.objects.filter(
                     id=profesional_id,
                     is_active=True,
@@ -168,7 +170,7 @@ class CitaViewSet(viewsets.ModelViewSet):
                 ).first()
 
                 if not profesional:
-                    raise ValidationError({"profesional": "Profesional inválido."})
+                    raise ValidationError({"profesional": "El profesional está inactivo o no existe."})
 
                 return profesional
 

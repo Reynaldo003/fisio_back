@@ -42,6 +42,16 @@ class StaffUserViewSet(
     def get_queryset(self):
         return User.objects.filter(staff_profile__isnull=False).select_related("staff_profile", "staff_profile__rol_personalizado").order_by("-id")
 
+    def destroy(self, request, *args, **kwargs):
+        usuario = self.get_object()
+        if usuario.pk == request.user.pk:
+            return Response({"detail": "No puedes desactivar tu propia cuenta."}, status=400)
+        if usuario.is_active:
+            usuario.is_active = False
+            usuario.save(update_fields=["is_active"])
+        serializer = self.get_serializer(usuario)
+        return Response(serializer.data, status=200)
+
 
 class RolPersonalizadoViewSet(viewsets.ModelViewSet):
     queryset = RolPersonalizado.objects.all().order_by("nombre")
