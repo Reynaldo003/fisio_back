@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "corsheaders",
     'core.apps.CoreConfig',
+    'imagenes_sitio.apps.ImagenesSitioConfig',
 ]
 
 CORS_ALLOWED_ORIGINS = [

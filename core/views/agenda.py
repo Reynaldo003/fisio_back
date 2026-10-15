@@ -2,13 +2,16 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.contrib.auth.models import User
-from django.db.models import Count, Sum
+from django.db.models import Count, Sum, Max, Q
 from django.utils.dateparse import parse_date
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+
+from control_operativo.models import OrigenCita, OrigenPaciente
+from control_operativo.servicios import guardar_bitacora, snapshot_cita, sincronizar_comisiones_cita
 
 from core.models import (
     BloqueoHorario,
@@ -223,7 +226,23 @@ class CitaViewSet(viewsets.ModelViewSet):
             **self._valores_financieros_servidor(servicio),
         }
 
-        serializer.save(**kwargs)
+        paciente_payload = data.get('paciente')
+        paciente_nuevo = isinstance(paciente_payload, dict) and not any((
+            paciente_payload.get('id'), paciente_payload.get('uuid'),
+            data.get('paciente_id'), data.get('paciente_uuid'),
+        ))
+        cita = serializer.save(**kwargs)
+        OrigenCita.objects.update_or_create(cita=cita, defaults={'agendada_por': self.request.user, 'rol_al_agendar': rol_usuario(self.request.user) or ''})
+        if paciente_nuevo and rol_usuario(self.request.user) == 'recepcion':
+            OrigenPaciente.objects.get_or_create(
+                paciente=cita.paciente,
+                defaults={'registrado_por': self.request.user,
+                          'origen': data.get('origen', 'nuevo') if data.get('origen') in ('nuevo', 'recomendado', 'otro') else 'nuevo',
+                          'rol_registro': 'recepcion'},
+            )
+        sincronizar_comisiones_cita(cita)
+        guardar_bitacora(usuario=self.request.user, tipo='cita', objeto_id=cita.pk,
+                         accion='crear', nuevo=snapshot_cita(cita))
 
     def perform_update(self, serializer):
         instance = serializer.instance
@@ -235,7 +254,12 @@ class CitaViewSet(viewsets.ModelViewSet):
                 instance=instance,
             ),
         }
-        serializer.save(**kwargs)
+        anterior = snapshot_cita(instance)
+        cita = serializer.save(**kwargs)
+        despues = snapshot_cita(cita)
+        if anterior != despues:
+            guardar_bitacora(usuario=self.request.user, tipo='cita', objeto_id=cita.pk,
+                             accion='editar', anterior=anterior, nuevo=despues)
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -256,7 +280,14 @@ class CitaViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def destroy(self, request, *args, **kwargs):
+        if not es_admin(request.user):
+            return Response({'detail': 'Solo administración puede eliminar definitivamente citas. Usa cancelación si corresponde.'}, status=403)
         instance = self.get_object()
+        if instance.pagos.exists():
+            return Response({'detail': 'No puedes eliminar una cita con pagos. Cancélala para conservar el historial.'}, status=409)
+        anterior = snapshot_cita(instance)
+        guardar_bitacora(usuario=request.user, tipo='cita', objeto_id=instance.pk,
+                         accion='eliminar', anterior=anterior)
         self.perform_destroy(instance)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -426,6 +457,25 @@ class CitaViewSet(viewsets.ModelViewSet):
             .order_by("-total", "paciente__apellido_pat")[:20]
         )
 
+        # Pacientes activos que llevan más de tres días desde su última cita completada.
+        clinica_alertas = clinica_usuario(request.user) or primera_clinica()
+        pacientes_inactivos_qs = Paciente.objects.filter(estado_tratamiento='en_tratamiento')
+        if clinica_alertas:
+            pacientes_inactivos_qs = pacientes_inactivos_qs.filter(clinica=clinica_alertas)
+        if profesional:
+            pacientes_inactivos_qs = pacientes_inactivos_qs.filter(citas__profesional=profesional)
+        elif not puede_ver_todas_agendas(rol):
+            pacientes_inactivos_qs = pacientes_inactivos_qs.filter(citas__profesional=request.user)
+        limite_inactividad = referencia - timedelta(days=3)
+        pacientes_inactivos_qs = (pacientes_inactivos_qs
+            .annotate(ultima_visita=Max('citas__fecha', filter=Q(citas__estado='completado')))
+            .filter(ultima_visita__lt=limite_inactividad).order_by('ultima_visita')[:20])
+        alertas_inactividad = [
+            {'paciente_id': p.id, 'paciente': nombre_paciente(p),
+             'ultima_visita': p.ultima_visita, 'dias_sin_venir': (referencia - p.ultima_visita).days}
+            for p in pacientes_inactivos_qs
+        ]
+
         alertas_no_asistencia = [
             {
                 "paciente_id": row["paciente_id"],
@@ -558,6 +608,7 @@ class CitaViewSet(viewsets.ModelViewSet):
                 "finanzas": finanzas,
                 "alertas": {
                     "no_asistencias": alertas_no_asistencia,
+                    "inactivos": alertas_inactividad,
                     "cumpleanos": cumpleanos,
                     "cobros_pendientes": alertas_cobro,
                 },
@@ -604,7 +655,10 @@ class BloqueoHorarioViewSet(viewsets.ModelViewSet):
                         {"profesional": "Profesional inválido."}
                     )
 
-        serializer.save(profesional=profesional)
+        bloqueo = serializer.save(profesional=profesional)
+        guardar_bitacora(usuario=self.request.user, tipo='bloqueo', objeto_id=bloqueo.pk,
+                         accion='crear', nuevo={'fecha': str(bloqueo.fecha), 'inicio': str(bloqueo.hora_inicio),
+                                                'fin': str(bloqueo.hora_termina), 'profesional_id': bloqueo.profesional_id})
 
     def perform_update(self, serializer):
         rol = rol_usuario(self.request.user)
@@ -621,13 +675,23 @@ class BloqueoHorarioViewSet(viewsets.ModelViewSet):
                     raise ValidationError(
                         {"profesional": "Profesional inválido."}
                     )
-                serializer.save(profesional=profesional)
+                anterior = {'fecha': str(serializer.instance.fecha), 'inicio': str(serializer.instance.hora_inicio),
+                            'fin': str(serializer.instance.hora_termina)}
+                bloqueo = serializer.save(profesional=profesional)
+                guardar_bitacora(usuario=self.request.user, tipo='bloqueo', objeto_id=bloqueo.id,
+                    accion='editar', anterior=anterior, nuevo={'fecha': str(bloqueo.fecha), 'inicio': str(bloqueo.hora_inicio), 'fin': str(bloqueo.hora_termina)})
                 return
 
-            serializer.save()
-            return
+            bloqueo = serializer.save()
+        else:
+            bloqueo = serializer.save(profesional=self.request.user)
+        guardar_bitacora(usuario=self.request.user, tipo='bloqueo', objeto_id=bloqueo.pk,
+            accion='editar', nuevo={'fecha': str(bloqueo.fecha), 'inicio': str(bloqueo.hora_inicio), 'fin': str(bloqueo.hora_termina)})
 
-        serializer.save(profesional=self.request.user)
+    def perform_destroy(self, instance):
+        guardar_bitacora(usuario=self.request.user, tipo='bloqueo', objeto_id=instance.pk,
+            accion='eliminar', anterior={'fecha': str(instance.fecha), 'inicio': str(instance.hora_inicio), 'fin': str(instance.hora_termina)})
+        instance.delete()
 
 
 @api_view(["GET"])
@@ -797,9 +861,8 @@ def public_create_cita(request):
         pagado=False,
     )
 
-    return Response(
-        CitaSerializer(cita).data,
-        status=201,
-    )
+    guardar_bitacora(usuario=None, tipo='cita', objeto_id=cita.pk,
+                     accion='crear_publica', nuevo=snapshot_cita(cita))
+    return Response(CitaSerializer(cita).data, status=201)
 
 

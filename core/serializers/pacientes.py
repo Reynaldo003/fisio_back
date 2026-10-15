@@ -1,7 +1,5 @@
 from pathlib import Path
-
 from rest_framework import serializers
-
 from core.models import DocumentoPaciente, Paciente, RegistroClinico
 from core.utilidades import puede_ver_contacto_paciente
 
@@ -12,54 +10,48 @@ class PacienteInlineSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Paciente
-        fields = ["id", "uuid", "nombres", "apellido_pat", "apellido_mat", "fecha_nac", "genero", "telefono", "correo", "molestia", "notas"]
+        fields = ['id', 'uuid', 'nombres', 'apellido_pat', 'apellido_mat', 'fecha_nac', 'genero', 'telefono', 'correo', 'molestia', 'notas']
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        request = self.context.get("request")
-
+        request = self.context.get('request')
         if request and not puede_ver_contacto_paciente(request.user):
-            data.pop("telefono", None)
-            data.pop("correo", None)
-
+            data.pop('telefono', None)
+            data.pop('correo', None)
         return data
 
 
 class PacienteListadoSerializer(serializers.ModelSerializer):
     foto_url = serializers.SerializerMethodField()
-    clinica_nombre = serializers.CharField(source="clinica.nombre", read_only=True)
+    clinica_nombre = serializers.CharField(source='clinica.nombre', read_only=True)
     ultimo_servicio = serializers.CharField(read_only=True, allow_null=True)
     ultima_cita_fecha = serializers.DateField(read_only=True, allow_null=True)
     total_citas = serializers.IntegerField(read_only=True)
+    citas_completadas = serializers.IntegerField(read_only=True)
+    citas_canceladas = serializers.IntegerField(read_only=True)
+    citas_reservadas = serializers.IntegerField(read_only=True)
+    citas_confirmadas = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Paciente
-        fields = [
-            "id", "uuid", "clinica", "clinica_nombre", "nombres", "apellido_pat", "apellido_mat", "fecha_nac", "genero",
-            "telefono", "correo", "molestia", "notas", "foto_url", "registro", "estado_tratamiento", "fecha_alta",
-            "ultimo_servicio", "ultima_cita_fecha", "total_citas",
-        ]
+        fields = ['id', 'uuid', 'clinica', 'clinica_nombre', 'nombres', 'apellido_pat', 'apellido_mat', 'fecha_nac', 'genero', 'telefono', 'correo', 'molestia', 'notas', 'foto_url', 'registro', 'estado_tratamiento', 'fecha_alta', 'ultimo_servicio', 'ultima_cita_fecha', 'total_citas', 'citas_completadas', 'citas_canceladas', 'citas_reservadas', 'citas_confirmadas']
 
     def get_foto_url(self, obj):
-        if not obj.foto:
-            return None
-        request = self.context.get("request")
-        return request.build_absolute_uri(obj.foto.url) if request else obj.foto.url
+        request = self.context.get('request')
+        return request.build_absolute_uri(obj.foto.url) if request and obj.foto else obj.foto.url if obj.foto else None
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        request = self.context.get("request")
-
+        request = self.context.get('request')
         if request and not puede_ver_contacto_paciente(request.user):
-            data.pop("telefono", None)
-            data.pop("correo", None)
-
+            data.pop('telefono', None)
+            data.pop('correo', None)
         return data
 
 
 class PacienteSerializer(PacienteListadoSerializer):
     class Meta(PacienteListadoSerializer.Meta):
-        read_only_fields = ["id", "uuid", "registro", "ultimo_servicio", "ultima_cita_fecha", "total_citas", "foto_url", "clinica_nombre"]
+        read_only_fields = ['id', 'uuid', 'registro', 'ultimo_servicio', 'ultima_cita_fecha', 'total_citas', 'citas_completadas', 'citas_canceladas', 'citas_reservadas', 'citas_confirmadas', 'foto_url', 'clinica_nombre']
 
 
 class DocumentoPacienteSerializer(serializers.ModelSerializer):
@@ -69,35 +61,30 @@ class DocumentoPacienteSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DocumentoPaciente
-        fields = ["id", "paciente", "archivo", "archivo_url", "nombre_original", "tipo", "descripcion", "tamano", "subido_por", "subido_por_nombre", "creado"]
-        read_only_fields = ["id", "paciente", "archivo_url", "nombre_original", "tamano", "subido_por", "subido_por_nombre", "creado"]
-        extra_kwargs = {"archivo": {"write_only": True}}
+        fields = ['id', 'paciente', 'archivo', 'archivo_url', 'nombre_original', 'tipo', 'descripcion', 'tamano', 'subido_por', 'subido_por_nombre', 'creado']
+        read_only_fields = ['id', 'paciente', 'archivo_url', 'nombre_original', 'tamano', 'subido_por', 'subido_por_nombre', 'creado']
+        extra_kwargs = {'archivo': {'write_only': True}}
 
     def validate_archivo(self, archivo):
-        permitidas = {".pdf", ".doc", ".docx", ".jpg", ".jpeg", ".png", ".webp"}
         ext = Path(archivo.name).suffix.lower()
-        if ext not in permitidas:
-            raise serializers.ValidationError("Formato no permitido. Usa PDF, Word, JPG, PNG o WEBP.")
+        if ext not in {'.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png', '.webp'}:
+            raise serializers.ValidationError('Formato no permitido. Usa PDF, Word, JPG, PNG o WEBP.')
         if archivo.size > 15 * 1024 * 1024:
-            raise serializers.ValidationError("El archivo no puede superar 15 MB.")
+            raise serializers.ValidationError('El archivo no puede superar 15 MB.')
         return archivo
 
     def get_archivo_url(self, obj):
-        if not obj.archivo:
-            return None
-        request = self.context.get("request")
+        if not obj.archivo: return None
+        request = self.context.get('request')
         return request.build_absolute_uri(obj.archivo.url) if request else obj.archivo.url
 
     def get_tamano(self, obj):
-        try:
-            return obj.archivo.size
-        except Exception:
-            return 0
+        try: return obj.archivo.size
+        except Exception: return 0
 
     def get_subido_por_nombre(self, obj):
-        if not obj.subido_por:
-            return None
-        return (obj.subido_por.get_full_name() or "").strip() or obj.subido_por.username
+        if not obj.subido_por: return None
+        return (obj.subido_por.get_full_name() or '').strip() or obj.subido_por.username
 
 
 class RegistroClinicoSerializer(serializers.ModelSerializer):
@@ -105,10 +92,9 @@ class RegistroClinicoSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = RegistroClinico
-        fields = ["id", "paciente", "fecha", "titulo", "descripcion", "profesional", "profesional_nombre", "creado", "actualizado"]
-        read_only_fields = ["id", "paciente", "profesional", "profesional_nombre", "creado", "actualizado"]
+        fields = ['id', 'paciente', 'fecha', 'titulo', 'descripcion', 'profesional', 'profesional_nombre', 'creado', 'actualizado']
+        read_only_fields = ['id', 'paciente', 'profesional', 'profesional_nombre', 'creado', 'actualizado']
 
     def get_profesional_nombre(self, obj):
-        if not obj.profesional:
-            return None
-        return (obj.profesional.get_full_name() or "").strip() or obj.profesional.username
+        if not obj.profesional: return None
+        return (obj.profesional.get_full_name() or '').strip() or obj.profesional.username

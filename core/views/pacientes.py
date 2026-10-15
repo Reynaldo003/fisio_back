@@ -24,6 +24,10 @@ from rest_framework.parsers import (
 )
 from rest_framework.response import Response
 
+from control_operativo.models import OrigenPaciente
+from core.utilidades import rol_usuario, es_admin
+from control_operativo.servicios import guardar_bitacora, snapshot_cita
+
 from core.models import (
     Cita,
     DocumentoPaciente,
@@ -376,6 +380,13 @@ class PacienteViewSet(viewsets.ModelViewSet):
             )[:1]
         )
 
+        def contar_estado(estado):
+            return Coalesce(Subquery(
+                Cita.objects.filter(paciente_id=OuterRef('pk'), estado=estado)
+                .values('paciente_id').annotate(total=Count('id')).values('total')[:1],
+                output_field=IntegerField(),
+            ), Value(0))
+
         return (
             qs
             .annotate(
@@ -389,6 +400,10 @@ class PacienteViewSet(viewsets.ModelViewSet):
                         "fecha"
                     )[:1]
                 ),
+                citas_completadas=contar_estado('completado'),
+                citas_canceladas=contar_estado('cancelado'),
+                citas_reservadas=contar_estado('reservado'),
+                citas_confirmadas=contar_estado('confirmado'),
                 total_citas=Coalesce(
                     Subquery(
                         conteo,
@@ -573,6 +588,9 @@ class PacienteViewSet(viewsets.ModelViewSet):
                 status.HTTP_409_CONFLICT,
             )
 
+        if decision_eliminar is True and citas_posteriores.filter(pagos__isnull=False).exists():
+            return Response({'detail': 'Hay citas posteriores con abonos. No pueden eliminarse sin revisar los pagos.'}, status=409)
+
         serializer = (
             self.get_serializer(
                 paciente,
@@ -597,10 +615,11 @@ class PacienteViewSet(viewsets.ModelViewSet):
                 and
                 decision_eliminar is True
             ):
-                citas_eliminadas = (
-                    total_citas_posteriores
-                )
+                citas_eliminadas = total_citas_posteriores
 
+                for cita_eliminada in citas_posteriores:
+                    guardar_bitacora(usuario=request.user, tipo='cita', objeto_id=cita_eliminada.pk,
+                                     accion='eliminar_por_alta', anterior=snapshot_cita(cita_eliminada))
                 citas_posteriores.delete()
 
         response_data = dict(
@@ -628,7 +647,15 @@ class PacienteViewSet(viewsets.ModelViewSet):
         if serializer.validated_data.get(
             "clinica"
         ):
-            serializer.save()
+            paciente = serializer.save()
+            if rol_usuario(self.request.user) == 'recepcion':
+                origen = self.request.data.get('origen', 'nuevo')
+                OrigenPaciente.objects.get_or_create(
+                    paciente=paciente,
+                    defaults={'registrado_por': self.request.user,
+                              'origen': origen if origen in ('nuevo', 'recomendado', 'otro') else 'nuevo',
+                              'rol_registro': 'recepcion'},
+                )
             return
 
         clinica = (
@@ -651,9 +678,15 @@ class PacienteViewSet(viewsets.ModelViewSet):
                 "disponible para el usuario."
             )
 
-        serializer.save(
-            clinica=clinica
-        )
+        paciente = serializer.save(clinica=clinica)
+        if rol_usuario(self.request.user) == 'recepcion':
+            origen = self.request.data.get('origen', 'nuevo')
+            OrigenPaciente.objects.get_or_create(
+                paciente=paciente,
+                defaults={'registrado_por': self.request.user,
+                          'origen': origen if origen in ('nuevo', 'recomendado', 'otro') else 'nuevo',
+                              'rol_registro': 'recepcion'},
+            )
 
     @action(
         detail=False,
@@ -709,7 +742,7 @@ class PacienteViewSet(viewsets.ModelViewSet):
                     ).count(),
 
                 "sesiones":
-                    citas_qs.count(),
+                    citas_qs.filter(estado='completado').count(),
             }
         )
 
@@ -1296,7 +1329,11 @@ class PacienteViewSet(viewsets.ModelViewSet):
         *args,
         **kwargs,
     ):
+        if not es_admin(request.user):
+            return Response({'detail': 'Solo administración puede eliminar pacientes.'}, status=403)
         paciente = self.get_object()
+        if paciente.citas.filter(pagos__isnull=False).exists():
+            return Response({'detail': 'El paciente tiene pagos registrados. No se permite eliminar su historial financiero; puedes darlo de alta.'}, status=409)
 
         total_citas = (
             paciente.citas.count()
@@ -1353,6 +1390,9 @@ class PacienteViewSet(viewsets.ModelViewSet):
                     save=False
                 )
 
+            for cita_eliminada in paciente.citas.all():
+                guardar_bitacora(usuario=request.user, tipo='cita', objeto_id=cita_eliminada.pk,
+                                 accion='eliminar_paciente', anterior=snapshot_cita(cita_eliminada))
             paciente.delete()
 
         return Response(

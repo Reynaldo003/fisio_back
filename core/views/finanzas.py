@@ -19,6 +19,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from core.models import Cita, MovimientoInsumo, Pago, VentaInsumo
+from control_operativo.models import ComisionPago, ComisionVentaInsumo
 from core.permissions import PuedeModificarDinero, PuedeVerDinero, PuedeVerFinanzas
 from core.serializers.finanzas import PagoSerializer
 from core.utilidades import clinica_usuario, primera_clinica, puede_ver_dinero, rol_usuario
@@ -489,12 +490,38 @@ class PagoViewSet(viewsets.ModelViewSet):
         total_ventas_insumos = sum((Decimal(r["total_ingreso"]) for r in registros if r["tipo"] == "insumo"), Decimal("0"))
         total_ingresos = total_servicios + total_ventas_insumos
         total_egresos = sum((Decimal(item["monto"]) for item in egresos), Decimal("0"))
-        total_neto = total_ingresos - total_egresos
+        # Comisión por pago, con porcentaje histórico congelado al registrarse.
+        comisiones = ComisionPago.objects.filter(pago__in=pagos)
+        monto_comisiones = comisiones.aggregate(
+            mp=models.Sum('monto_mp'), recepcion=models.Sum('monto_recepcion'))
+        comisiones_insumos = ComisionVentaInsumo.objects.filter(venta__in=ventas_insumos)
+        total_mp_insumos = comisiones_insumos.aggregate(total=models.Sum('monto_mp'))['total'] or Decimal('0')
+        comisiones_por_venta = {item.venta_id: item for item in comisiones_insumos}
+        total_mp = (monto_comisiones['mp'] or Decimal('0')) + total_mp_insumos
+        total_recepcion = monto_comisiones['recepcion'] or Decimal('0')
+        comisiones_por_pago = {item.pago_id: item for item in comisiones}
+        for registro in registros:
+            registro['comision_mp'] = Decimal('0')
+            registro['comision_recepcion'] = Decimal('0')
+            if registro['tipo'] == 'insumo':
+                detalle = comisiones_por_venta.get(registro['id'])
+                if detalle:
+                    registro['comision_mp'] = detalle.monto_mp
+                    registro['total_neto'] -= detalle.monto_mp
+            if registro['tipo'] == 'servicio':
+                # La ID de movimiento de servicio es la ID del pago.
+                detalle = comisiones_por_pago.get(registro['id'])
+                if detalle:
+                    registro['comision_mp'] = detalle.monto_mp
+                    registro['comision_recepcion'] = detalle.monto_recepcion
+                    registro['total_neto'] -= detalle.monto_mp + detalle.monto_recepcion
+        total_neto = total_ingresos - total_egresos - total_mp - total_recepcion
 
         return {
             "desde": desde, "hasta": hasta, "criterio_ingresos": "fecha_pago", "registros": registros, "egresos": egresos,
             "total_servicios": total_servicios, "total_ventas_insumos": total_ventas_insumos,
-            "total_ingresos": total_ingresos, "total_egresos_insumos": total_egresos, "total_neto": total_neto,
+            "total_ingresos": total_ingresos, "total_egresos_insumos": total_egresos,
+            "total_comisiones_mp": total_mp, "total_comisiones_recepcion": total_recepcion, "total_neto": total_neto,
             "por_metodo": [{"metodo": k, "total": v} for k, v in sorted(por_metodo.items(), key=lambda x: x[1], reverse=True)],
             "por_servicio": [{"servicio": k, "total": v} for k, v in sorted(por_servicio.items(), key=lambda x: x[1], reverse=True)],
             "por_profesional": [{"profesional": k, "total": v} for k, v in sorted(por_profesional.items(), key=lambda x: x[1], reverse=True)],
@@ -532,6 +559,8 @@ class PagoViewSet(viewsets.ModelViewSet):
             ("Venta de insumos", data["total_ventas_insumos"]),
             ("Total ingresos", data["total_ingresos"]),
             ("Egresos / insumos", data["total_egresos_insumos"]),
+            ("Comisión Mercado Pago", data["total_comisiones_mp"]),
+            ("Comisión recepción", data["total_comisiones_recepcion"]),
             ("Total neto", data["total_neto"]),
         ]
         for idx, (label, value) in enumerate(kpis, start=7):
@@ -568,7 +597,7 @@ class PagoViewSet(viewsets.ModelViewSet):
         bar.add_data(values, titles_from_data=True); bar.set_categories(cats); bar.height = 8; bar.width = 12; ws.add_chart(bar, "D21")
 
         detail = wb.create_sheet("Detalle corte")
-        headers = ["Tipo", "Categoría", "Fecha pago", "Fecha cita", "Nombre de cliente", "Servicio / producto", "Método de pago", "Costo", "Egreso = insumo", "Total ingreso", "Total neto", "Profesional", "Referencia"]
+        headers = ["Tipo", "Categoría", "Fecha pago", "Fecha cita", "Nombre de cliente", "Servicio / producto", "Método de pago", "Costo", "Egreso = insumo", "Total ingreso", "Total neto", "Profesional", "Referencia", "Comisión MP", "Comisión recepción"]
         detail.append(headers)
         for cell in detail[1]:
             cell.fill = PatternFill("solid", fgColor=navy); cell.font = Font(color=white, bold=True); cell.alignment = Alignment(horizontal="center")
@@ -576,6 +605,7 @@ class PagoViewSet(viewsets.ModelViewSet):
             detail.append([
                 row["tipo"], row["categoria"], row["fecha_pago"], row["fecha_cita"], row["nombre_cliente"], row["servicio"], row["metodo_pago"],
                 float(row["costo"]), float(row["egreso_insumo"]), float(row["total_ingreso"]), float(row["total_neto"]), row["profesional"], row["referencia"],
+                float(row["comision_mp"]), float(row["comision_recepcion"]),
             ])
         for row in detail.iter_rows(min_row=2, min_col=8, max_col=11):
             for cell in row:
