@@ -1,3 +1,4 @@
+#fisionerv_backend/settings.py
 """
 Django settings for fisionerv_backend project.
 
@@ -43,6 +44,7 @@ INSTALLED_APPS = [
     "corsheaders",
     'core.apps.CoreConfig',
     'imagenes_sitio.apps.ImagenesSitioConfig',
+    'control_operativo.apps.ControlOperativoConfig',
 ]
 
 CORS_ALLOWED_ORIGINS = [

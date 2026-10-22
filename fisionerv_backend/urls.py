@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/", include("core.urls")),
     path("api/", include("core.urls.insumos")),
     path("api/", include("imagenes_sitio.urls")),
+    path("api/", include("control_operativo.urls")),
 ]
 
 if settings.DEBUG:
